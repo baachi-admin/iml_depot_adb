@@ -1,296 +1,10 @@
 <!DOCTYPE html>
-<html lang="en"><head>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
-    <script>
-      (function() {
-        const originalConsole = window.console;
-        window.console = {
-          log: (...args) => {
-            originalConsole.log(...args);
-            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
-          },
-          error: (...args) => {
-            originalConsole.error(...args);
-            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
-          },
-          warn: (...args) => {
-            originalConsole.warn(...args);
-            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
-          }
-        };
-
-        let requestId = 0;
-        let callbacksMap = new Map();
-        let streamControllers = new Map();
-        
-        window.claude = {
-          complete: (prompt) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
-            });
-          }
-        };
-
-        window.storage = {
-          get: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
-            });
-          },
-          set: (key, value, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
-            });
-          },
-          delete: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
-            });
-          },
-          list: (prefix, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = requestId++;
-              callbacksMap.set(id, { resolve, reject });
-              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
-            });
-          }
-        };
-
-        let pendingBlobs = new Map();
-        URL.createObjectURL = (blob) => {
-          // Store the blob and create an ID and URL for it
-          const blobId = `blob-${Date.now()}-${Math.random()}`;
-          pendingBlobs.set(blobId, blob);
-          return `blob-request://${blobId}`;
-        };
-
-        URL.revokeObjectURL = (url) => {
-          // Remove the blob from our store
-          const blobId = url.replace("blob-request://", "");
-          pendingBlobs.delete(blobId);
-        };
-
-        const getBlobFromURL = (url) => {
-          const blobId = url.replace("blob-request://", "");
-          return pendingBlobs.get(blobId);
-        };
-
-        // Override global fetch with streaming support
-        window.fetch = (url, init = {}) => {
-          return new Promise((resolve, reject) => {
-            const id = requestId++;
-            const channelId = `fetch-${id}-${Date.now()}`;
-            
-            callbacksMap.set(id, { 
-              resolve: (response) => {
-                // Create a ReadableStream for the response body
-                const stream = new ReadableStream({
-                  start(controller) {
-                    streamControllers.set(channelId, controller);
-                  },
-                  cancel() {
-                    streamControllers.delete(channelId);
-                  }
-                });
-                
-                // Create and return the Response with the stream
-                resolve(new Response(stream, {
-                  status: response.status,
-                  statusText: response.statusText,
-                  headers: response.headers
-                }));
-              },
-              reject,
-              channelId
-            });
-            
-            window.parent.postMessage({
-              type: 'proxyFetch',
-              id,
-              url,
-              init,
-              channelId
-            }, '*');
-          });
-        };
-
-        window.addEventListener('message', async (event) => {
-          if (event.data.type === 'takeScreenshot') {
-            const rootElement = document.getElementById('artifacts-component-root-html');
-            if (!rootElement) {
-              window.parent.postMessage({
-                type: 'screenshotError',
-                error: new Error('Root element not found'),
-              }, '*');
-            }
-            const screenshot = await htmlToImage.toPng(rootElement, {
-              imagePlaceholder:
-                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
-            });
-            window.parent.postMessage({
-              type: 'screenshotData',
-              data: screenshot,
-            }, '*');
-          } else if (event.data.type === 'claudeComplete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.completion);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'proxyFetchResponse') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-              callbacksMap.delete(event.data.id);
-            } else {
-              // Initial response with headers, status, etc.
-              callback.resolve({
-                status: event.data.status,
-                statusText: event.data.statusText,
-                headers: event.data.headers
-              });
-              // Don't delete the callback yet if streaming
-              if (!event.data.body) {
-                callbacksMap.delete(event.data.id);
-              }
-            }
-          } else if (event.data.type === 'proxyFetchStream') {
-            // Handle streaming data chunks
-            const controller = streamControllers.get(event.data.channelId);
-            if (controller) {
-              if (event.data.error) {
-                controller.error(new Error(event.data.error));
-                streamControllers.delete(event.data.channelId);
-              } else if (event.data.done) {
-                controller.close();
-                streamControllers.delete(event.data.channelId);
-                // Clean up the callback
-                const callback = Array.from(callbacksMap.entries()).find(
-                  ([_, value]) => value.channelId === event.data.channelId
-                );
-                if (callback) {
-                  callbacksMap.delete(callback[0]);
-                }
-              } else if (event.data.chunk) {
-                controller.enqueue(new Uint8Array(event.data.chunk));
-              }
-            }
-          } else if (event.data.type === 'storageGet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageSet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageDelete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageList') {
-            const callback = callbacksMap.get(event.data.id);
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          }
-        });
-
-        window.addEventListener('click', (event) => {
-          const isEl = event.target instanceof HTMLElement;
-          if (!isEl) return;
-    
-          // find ancestor links
-          const linkEl = event.target.closest("a");
-          if (!linkEl || !linkEl.href) return;
-    
-          event.preventDefault();
-          event.stopImmediatePropagation();
-    
-          if (linkEl.href.startsWith("blob-request:")) {
-            const blob = getBlobFromURL(linkEl.href);
-            if (!blob) return;
-            void blob.arrayBuffer().then((data) => {
-              window.parent.postMessage({
-                type: "downloadFile",
-                filename: linkEl.download,
-                data,
-                mimeType: blob.type || "application/octet-stream",
-              });
-            });
-          } else if (linkEl.href.startsWith("data:")) {
-            const [header, base64Data] = linkEl.href.split(",");
-            const mimeMatch = header.match(/data:([^;]+)/);
-            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
-            const binaryString = atob(base64Data);
-            const data = Uint8Array.from(binaryString, (c) =>
-              c.charCodeAt(0),
-            ).buffer;
-            window.parent.postMessage({
-              type: "downloadFile",
-              filename: linkEl.download,
-              data,
-              mimeType,
-            });
-          } else {
-            let linkUrl;
-            try {
-              linkUrl = new URL(linkEl.href);
-            } catch (error) {
-              return;
-            }
-    
-            if (linkUrl.hostname === window.location.hostname) return;
-      
-            window.parent.postMessage({
-              type: 'openExternal',
-              href: linkEl.href,
-            }, '*');
-          }
-      });
-
-        const originalOpen = window.open;
-        window.open = function (url) {
-          window.parent.postMessage({
-            type: "openExternal",
-            href: url,
-          }, "*");
-        };
-
-        window.addEventListener('error', (event) => {
-          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
-        });
-      })();
-    </script>
-  
+<html lang="en">
+<head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>IML DEPOT ADILABAD</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&amp;family=JetBrains+Mono:wght@400;700&amp;display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
 <style>
   :root {
     --bg: #0a0f1e;
@@ -506,17 +220,17 @@
   }
 </style>
 </head>
-<body id="artifacts-component-root-html">
+<body>
 
 <!-- TOAST -->
-<div id="toast" style="background: rgb(16, 185, 129); display: none;">✅ Downloading...</div>
+<div id="toast"></div>
 
 <!-- ══════════════════ LOGIN SCREEN ══════════════════ -->
-<div id="loginScreen" style="display: none;">
+<div id="loginScreen" style="display:flex">
   <div class="login-card">
     <div class="login-logo">🍺</div>
     <h1 class="login-title">IML DEPOT ADILABAD</h1>
-    <p class="login-sub">IML Depot Adilabad — Sales &amp; Receipts Portal<br>Authorized Access Only</p>
+    <p class="login-sub">IML Depot Adilabad — Sales & Receipts Portal<br>Authorized Access Only</p>
     <div class="form-group">
       <label class="form-label">USERNAME</label>
       <input class="form-input" id="loginUser" type="text" placeholder="Enter username" autocomplete="off">
@@ -550,7 +264,7 @@
 </div>
 
 <!-- ══════════════════ APP SCREEN ══════════════════════ -->
-<div id="appScreen" style="display: block;">
+<div id="appScreen" style="display:none">
   <div class="app-layout">
 
     <!-- SIDEBAR OVERLAY (mobile) -->
@@ -565,34 +279,13 @@
           <div class="sidebar-sub">ADILABAD</div>
         </div>
       </div>
-      <nav class="nav" id="sideNav">
-    <button class="nav-item" id="nav-dashboard" onclick="navigate('dashboard')">
-      <span class="nav-icon">⊞</span><span>Dashboard</span>
-    </button>
-    <button class="nav-item" id="nav-retailers" onclick="navigate('retailers')">
-      <span class="nav-icon">👥</span><span>Retailer Master</span>
-    </button>
-    <button class="nav-item" id="nav-dailysales" onclick="navigate('dailysales')">
-      <span class="nav-icon">📉</span><span>Daily Sales Report</span>
-    </button>
-    <button class="nav-item" id="nav-executive" onclick="navigate('executive')">
-      <span class="nav-icon">📋</span><span>Executive Offtake</span>
-    </button>
-    <button class="nav-item" id="nav-uploads" onclick="navigate('uploads')">
-      <span class="nav-icon">📁</span><span>File Uploads</span>
-    </button>
-    <button class="nav-item active" id="nav-reports" onclick="navigate('reports')">
-      <span class="nav-icon">📊</span><span>Reports</span>
-    </button>
-    <button class="nav-item" id="nav-users" onclick="navigate('users')">
-      <span class="nav-icon">🔐</span><span>User Management</span>
-    </button></nav>
+      <nav class="nav" id="sideNav"></nav>
       <div class="sidebar-bottom">
         <div class="user-card">
-          <div class="user-avatar" id="userAvatar">D</div>
+          <div class="user-avatar" id="userAvatar">A</div>
           <div>
-            <div class="user-name" id="userName">Depot Manager</div>
-            <div class="user-role" id="userRoleTxt">Administration</div>
+            <div class="user-name" id="userName">Admin</div>
+            <div class="user-role" id="userRoleTxt">Administrator</div>
           </div>
         </div>
         <button class="logout-btn" onclick="doLogout()">⏻ Sign Out</button>
@@ -605,18 +298,18 @@
         <div class="header-left">
           <button class="hamburger" onclick="toggleSidebar()">☰</button>
           <div>
-            <div class="header-title" id="pageTitle">Reports</div>
-            <div class="header-date" id="headerDate">Sunday, 3 May 2026</div>
+            <div class="header-title" id="pageTitle">Dashboard</div>
+            <div class="header-date" id="headerDate"></div>
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:10px">
-          <div class="role-badge role-admin" id="roleBadge">👑 ADMIN</div>
-          <button onclick="downloadHTML()" title="Download this website" style="background: rgb(245, 158, 11); border: 1px solid rgb(245, 158, 11); color: rgb(10, 15, 30); padding: 7px 12px; border-radius: 8px; cursor: pointer; font-size: 12px; font-family: Inter, sans-serif; display: flex; align-items: center; gap: 6px;" onmouseover="this.style.background='#f59e0b';this.style.color='#0a0f1e';this.style.borderColor='#f59e0b'" onmouseout="this.style.background='#1e2d45';this.style.color='#94a3b8';this.style.borderColor='#334155'">
+          <div class="role-badge" id="roleBadge">ADMIN</div>
+          <button onclick="downloadHTML()" title="Download this website" style="background:#1e2d45;border:1px solid #334155;color:#94a3b8;padding:7px 12px;border-radius:8px;cursor:pointer;font-size:12px;font-family:Inter,sans-serif;display:flex;align-items:center;gap:6px" onmouseover="this.style.background='#f59e0b';this.style.color='#0a0f1e';this.style.borderColor='#f59e0b'" onmouseout="this.style.background='#1e2d45';this.style.color='#94a3b8';this.style.borderColor='#334155'">
             ⬇ Download
           </button>
         </div>
       </div>
-      <div class="content" id="pageContent"><div class="card" style="margin-bottom:14px;padding:16px 18px"><div style="font-size:14px;font-weight:800;color:#10b981;margin-bottom:12px">📊 Report Centre</div><div style="display:flex;flex-direction:column;gap:10px"><div class="form-group" style="margin:0"><label class="form-label">Report Type</label><div style="display:flex;flex-direction:column;gap:4px;margin-top:4px"><div onclick="rType='retailer_monthly';rGenerated=false;document.getElementById('reportOutputArea').innerHTML='';renderReports()" style="display:flex;align-items:center;gap:10px;padding:9px 14px;border-radius:8px;cursor:pointer;border:1.5px solid #1e2d45;background:#0a0f1e"><span style="font-size:16px">📋</span><span style="font-size:13px;font-weight:700;flex:1;color:#94a3b8">Retailer Monthly Offtake</span><div style="width:16px;height:16px;border-radius:50%;border:2px solid #334155;background:transparent;display:flex;align-items:center;justify-content:center"></div></div><div onclick="rType='retailer_brand';rGenerated=false;document.getElementById('reportOutputArea').innerHTML='';renderReports()" style="display:flex;align-items:center;gap:10px;padding:9px 14px;border-radius:8px;cursor:pointer;border:1.5px solid #1e2d45;background:#0a0f1e"><span style="font-size:16px">🏷</span><span style="font-size:13px;font-weight:700;flex:1;color:#94a3b8">Brand Wise Retailer Sales</span><div style="width:16px;height:16px;border-radius:50%;border:2px solid #334155;background:transparent;display:flex;align-items:center;justify-content:center"></div></div><div onclick="rType='circle_wise';rGenerated=false;document.getElementById('reportOutputArea').innerHTML='';renderReports()" style="display:flex;align-items:center;gap:10px;padding:9px 14px;border-radius:8px;cursor:pointer;border:1.5px solid #1e2d45;background:#0a0f1e"><span style="font-size:16px">🗺</span><span style="font-size:13px;font-weight:700;flex:1;color:#94a3b8">Circle Wise Sales</span><div style="width:16px;height:16px;border-radius:50%;border:2px solid #334155;background:transparent;display:flex;align-items:center;justify-content:center"></div></div><div onclick="rType='comparative';rGenerated=false;document.getElementById('reportOutputArea').innerHTML='';renderReports()" style="display:flex;align-items:center;gap:10px;padding:9px 14px;border-radius:8px;cursor:pointer;border:1.5px solid #1e2d45;background:#0a0f1e"><span style="font-size:16px">📊</span><span style="font-size:13px;font-weight:700;flex:1;color:#94a3b8">Comparative Statement</span><div style="width:16px;height:16px;border-radius:50%;border:2px solid #334155;background:transparent;display:flex;align-items:center;justify-content:center"></div></div><div onclick="rType='stock';rGenerated=false;document.getElementById('reportOutputArea').innerHTML='';renderReports()" style="display:flex;align-items:center;gap:10px;padding:9px 14px;border-radius:8px;cursor:pointer;border:1.5px solid #1e2d45;background:#0a0f1e"><span style="font-size:16px">📦</span><span style="font-size:13px;font-weight:700;flex:1;color:#94a3b8">Stock Position</span><div style="width:16px;height:16px;border-radius:50%;border:2px solid #334155;background:transparent;display:flex;align-items:center;justify-content:center"></div></div><div onclick="rType='mis';rGenerated=false;document.getElementById('reportOutputArea').innerHTML='';renderReports()" style="display:flex;align-items:center;gap:10px;padding:9px 14px;border-radius:8px;cursor:pointer;border:1.5px solid #a855f7;background:#a855f718"><span style="font-size:16px">🔍</span><span style="font-size:13px;font-weight:700;flex:1;color:#a855f7">MIS Summary</span><div style="width:16px;height:16px;border-radius:50%;border:2px solid #a855f7;background:#a855f7;display:flex;align-items:center;justify-content:center"><div style="width:7px;height:7px;border-radius:50%;background:#fff"></div></div></div></div></div><div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end"><div class="form-group" style="margin:0;min-width:130px"><label class="form-label">Month</label><select class="form-input" onchange="activeMonth=this.value;rGenerated=false"><option>November 2024</option><option>December 2024</option><option>January 2025</option><option>February 2025</option><option>March 2025</option><option>April 2025</option><option selected="">May 2025</option><option>June 2025</option><option>July 2025</option><option>August 2025</option><option>September 2025</option><option>October 2025</option><option>November 2025</option><option>December 2025</option><option>January 2026</option><option>February 2026</option><option>March 2026</option></select></div><button class="btn-primary" style="padding:10px 24px;font-size:13px" onclick="rGenerated=true;renderReportOutput()">⚡ Generate</button><button onclick="printRpt()" style="background:#1e3a8a;color:#fff;border:none;border-radius:8px;padding:10px 18px;font-weight:800;cursor:pointer;font-size:13px;font-family:Inter,sans-serif">📄 PDF</button></div></div></div><div id="reportOutputArea"><div class="card" style="padding:24px;text-align:center"><div style="font-size:40px;margin-bottom:12px">📊</div><div style="font-size:15px;font-weight:700;color:#e2e8f0;margin-bottom:8px">MIS PDF Upload చేయండి</div><div style="font-size:12px;color:#64748b;margin-bottom:16px">File Uploads → MIS Report PDF upload చేయండి<br>తర్వాత ఇక్కడ reports generate అవుతాయి</div><button onclick="navigate('uploads')" class="btn-primary">⬆ MIS Upload</button></div></div></div>
+      <div class="content" id="pageContent"></div>
     </div>
   </div>
 </div>
@@ -1112,124 +805,104 @@ function viewDailySalesPdf() {
   window.open(url, '_blank');
 }
 
-let MIS_DATA = null; // Parsed MIS PDF data
+let MIS_DATA = {
+  date: '01-Apr-2026 to 30-Apr-2026',
+  filename: 'MIS_April_2026.pdf',
+  parsedAt: new Date().toISOString(),
+  products: [
+    // BEER LOCAL
+    {sl:1,code:'1607B5019CAP',name:'BUDWEISER KING OF BEERS',category:'Beer Local',type:'Beer',obCases:0,obPrt:0,receipts:4124,salesCases:3828,salesPrt:18,cbCases:295,cbPrt:9,physStock:295},
+    {sl:2,code:'1607B5019GUP',name:'BUDWEISER KING OF BEERS (UP)',category:'Beer Local',type:'Beer',obCases:0,obPrt:0,receipts:100,salesCases:98,salesPrt:23,cbCases:1,cbPrt:0,physStock:1},
+    {sl:3,code:'1607B5019GBS',name:'BUDWEISER KING OF BEERS (BS)',category:'Beer Local',type:'Beer',obCases:1163,obPrt:9,receipts:2755,salesCases:3755,salesPrt:11,cbCases:161,cbPrt:2,physStock:161},
+    {sl:4,code:'1607B5031CAP',name:'BUDWEISER MAGNUM PREMIUM STRONG BEER',category:'Beer Local',type:'Beer',obCases:0,obPrt:16,receipts:5200,salesCases:4313,salesPrt:5,cbCases:886,cbPrt:16,physStock:886},
+    {sl:5,code:'1607B5031GBS',name:'BUDWEISER MAGNUM PREMIUM STRONG BEER (BS)',category:'Beer Local',type:'Beer',obCases:1266,obPrt:7,receipts:1969,salesCases:3234,salesPrt:0,cbCases:0,cbPrt:2,physStock:0},
+    {sl:6,code:'1668B6046GBS',name:'CARLSBERG ELEPHANT SUPERSTRONG BEER',category:'Beer Local',type:'Beer',obCases:57,obPrt:0,receipts:0,salesCases:56,salesPrt:11,cbCases:0,cbPrt:0,physStock:0},
+    {sl:7,code:'1760B5028GBS',name:'HAYWARDS 5000 SUPER STRONG BEER',category:'Beer Local',type:'Beer',obCases:6507,obPrt:14,receipts:18376,salesCases:11285,salesPrt:3,cbCases:13601,cbPrt:11,physStock:13601},
+    {sl:8,code:'1661B5016GBS',name:'KING FISHER PREMIUM LAGER BEER',category:'Beer Local',type:'Beer',obCases:45726,obPrt:15,receipts:39733,salesCases:27749,salesPrt:1,cbCases:57705,cbPrt:2,physStock:57706},
+    {sl:9,code:'1678B5016GBS',name:'KING FISHER PREMIUM LAGER BEER (NEW)',category:'Beer Local',type:'Beer',obCases:3047,obPrt:6,receipts:10536,salesCases:13577,salesPrt:6,cbCases:0,cbPrt:11,physStock:0},
+    {sl:10,code:'1661B5017GBS',name:'KING FISHER STRONG PREMIUM BEER',category:'Beer Local',type:'Beer',obCases:50960,obPrt:3,receipts:44015,salesCases:61957,salesPrt:7,cbCases:33005,cbPrt:3,physStock:33005},
+    {sl:11,code:'1661B5029GBS',name:'KINGFISHER ULTRA LAGER BEER',category:'Beer Local',type:'Beer',obCases:583,obPrt:1,receipts:1397,salesCases:1402,salesPrt:3,cbCases:577,cbPrt:10,physStock:577},
+    {sl:12,code:'1661B6536GBS',name:'KINGFISHER ULTRA MAX PREMIUM STRONG BEER',category:'Beer Local',type:'Beer',obCases:118,obPrt:0,receipts:500,salesCases:567,salesPrt:6,cbCases:50,cbPrt:0,physStock:50},
+    {sl:13,code:'1760B5030GBS',name:'KNOCKOUT HIGH PUNCH STRONG BEER',category:'Beer Local',type:'Beer',obCases:6152,obPrt:2,receipts:16707,salesCases:8344,salesPrt:2,cbCases:14516,cbPrt:2,physStock:14516},
+    {sl:14,code:'1760B5025GBS',name:'ROYAL CHALLENGE PREMIUM LAGER BEER',category:'Beer Local',type:'Beer',obCases:2675,obPrt:2,receipts:16705,salesCases:7060,salesPrt:11,cbCases:12321,cbPrt:2,physStock:12321},
+    // BEER NON LOCAL
+    {sl:15,code:'2551B5116GUP',name:'CORONA EXTRA PREMIUM MILD BEER',category:'Beer Non-Local',type:'Beer',obCases:0,obPrt:0,receipts:150,salesCases:53,salesPrt:0,cbCases:97,cbPrt:0,physStock:97},
+    // FOREIGN IML
+    {sl:16,code:'3007V8034GQQ',name:'ABSOLUT CITRON',category:'Foreign IML',type:'Vodka',obCases:9,obPrt:0,receipts:0,salesCases:0,salesPrt:0,cbCases:12,cbPrt:0,physStock:12},
+    {sl:17,code:'3007W9082GQQ',name:'CHIVAS REGAL AGED 12 YRS',category:'Foreign IML',type:'Whisky',obCases:23,obPrt:1,receipts:0,salesCases:0,salesPrt:0,cbCases:23,cbPrt:1,physStock:23},
+    {sl:18,code:'3007W8031GQQ',name:'JAMESON IRISH WHISKY',category:'Foreign IML',type:'Whisky',obCases:79,obPrt:0,receipts:0,salesCases:32,salesPrt:0,cbCases:47,cbPrt:0,physStock:47},
+    {sl:19,code:'2023W8098GQQ',name:'JOHNNIE WALKER BLACK LABEL',category:'Foreign IML',type:'Whisky',obCases:51,obPrt:0,receipts:0,salesCases:15,salesPrt:0,cbCases:36,cbPrt:0,physStock:36},
+    {sl:20,code:'2023W9099GQQ',name:'JOHNNIE WALKER RED LABEL',category:'Foreign IML',type:'Whisky',obCases:71,obPrt:0,receipts:0,salesCases:13,salesPrt:0,cbCases:58,cbPrt:0,physStock:58},
+    // IML LOCAL - Top products
+    {sl:21,code:'1623W0546PNN',name:'8PM PREMIUM BLACK WHISKY (NN)',category:'IML Local',type:'Whisky',obCases:1071,obPrt:0,receipts:450,salesCases:800,salesPrt:0,cbCases:721,cbPrt:0,physStock:721},
+    {sl:22,code:'1623W0546GPP',name:'8PM PREMIUM BLACK WHISKY (PP)',category:'IML Local',type:'Whisky',obCases:398,obPrt:22,receipts:0,salesCases:328,salesPrt:23,cbCases:69,cbPrt:22,physStock:69},
+    {sl:23,code:'1626W0596GQQ',name:'ANTIQUITY BLUE ULTRA PREMIUM WHISKY (QQ)',category:'IML Local',type:'Whisky',obCases:172,obPrt:8,receipts:140,salesCases:51,salesPrt:10,cbCases:260,cbPrt:8,physStock:260},
+    {sl:24,code:'1915W1746PNN',name:'DK DOUBLE KICK SUPERIOR WHISKY (NN)',category:'IML Local',type:'Whisky',obCases:0,obPrt:0,receipts:29396,salesCases:29395,salesPrt:46,cbCases:0,cbPrt:0,physStock:0},
+    {sl:25,code:'1915W1746PLL',name:'DK DOUBLE KICK SUPERIOR WHISKY (LL)',category:'IML Local',type:'Whisky',obCases:657,obPrt:0,receipts:2519,salesCases:3175,salesPrt:8,cbCases:0,cbPrt:0,physStock:0},
+    {sl:26,code:'1605W0742PNN',name:'DOWN TOWN WHISKY (NN)',category:'IML Local',type:'Whisky',obCases:1505,obPrt:0,receipts:7400,salesCases:6881,salesPrt:41,cbCases:2023,cbPrt:0,physStock:2023},
+    {sl:27,code:'1773W0439PNN',name:'GOLD MARK SELECT WHISKY (NN)',category:'IML Local',type:'Whisky',obCases:764,obPrt:0,receipts:3100,salesCases:3053,salesPrt:47,cbCases:810,cbPrt:0,physStock:810},
+    {sl:28,code:'1773W0439PDD',name:'GOLD MARK SELECT WHISKY (DD)',category:'IML Local',type:'Whisky',obCases:372,obPrt:0,receipts:400,salesCases:337,salesPrt:0,cbCases:435,cbPrt:0,physStock:435},
+    {sl:29,code:'1905W1756GPP',name:'ICONIQ WHITE SELECT GRAIN WHISKY (PP)',category:'IML Local',type:'Whisky',obCases:217,obPrt:10,receipts:100,salesCases:145,salesPrt:23,cbCases:171,cbPrt:10,physStock:171},
+    {sl:30,code:'1906W1756GNN',name:'ICONIQ WHITE SELECT GRAIN WHISKY (NN)',category:'IML Local',type:'Whisky',obCases:1053,obPrt:0,receipts:200,salesCases:502,salesPrt:47,cbCases:750,cbPrt:0,physStock:750},
+    {sl:31,code:'1913W0019GNN',name:'MCDOWELLS NO 1 LUXURY WHISKY (NN)',category:'IML Local',type:'Whisky',obCases:6153,obPrt:14,receipts:5920,salesCases:7490,salesPrt:30,cbCases:4583,cbPrt:41,physStock:4583},
+    {sl:32,code:'1913W0019GPP',name:'MCDOWELLS NO 1 LUXURY WHISKY (PP)',category:'IML Local',type:'Whisky',obCases:961,obPrt:11,receipts:250,salesCases:183,salesPrt:23,cbCases:1027,cbPrt:11,physStock:1027},
+    {sl:33,code:'1913W0019GQQ',name:'MCDOWELLS NO 1 LUXURY WHISKY (QQ)',category:'IML Local',type:'Whisky',obCases:489,obPrt:3,receipts:996,salesCases:467,salesPrt:10,cbCases:1019,cbPrt:9,physStock:1019},
+    {sl:34,code:'1906W0110PDD',name:"OFFICER'S CHOICE RESERVE WHISKY (DD)",category:'IML Local',type:'Whisky',obCases:8136,obPrt:0,receipts:585,salesCases:3112,salesPrt:0,cbCases:5609,cbPrt:0,physStock:5609},
+    {sl:35,code:'1906W0110PNN',name:"OFFICER'S CHOICE RESERVE WHISKY (NN)",category:'IML Local',type:'Whisky',obCases:17880,obPrt:0,receipts:5264,salesCases:11584,salesPrt:46,cbCases:11559,cbPrt:0,physStock:11559},
+    {sl:36,code:'1906W0110PQQ',name:"OFFICER'S CHOICE RESERVE WHISKY (QQ)",category:'IML Local',type:'Whisky',obCases:3418,obPrt:10,receipts:500,salesCases:2809,salesPrt:0,cbCases:1109,cbPrt:10,physStock:1109},
+    {sl:37,code:'1919W0456PNN',name:'ORIGINAL CHOICE SELECT WHISKY (NN)',category:'IML Local',type:'Whisky',obCases:7857,obPrt:0,receipts:6717,salesCases:5458,salesPrt:40,cbCases:9115,cbPrt:0,physStock:9115},
+    {sl:38,code:'1913W1233GNN',name:'ROYAL CHALLENGE BLENDED WHISKY (NN)',category:'IML Local',type:'Whisky',obCases:910,obPrt:41,receipts:0,salesCases:909,salesPrt:27,cbCases:0,cbPrt:41,physStock:0},
+    {sl:39,code:'1913W1233GPP',name:'ROYAL CHALLENGE BLENDED WHISKY (PP)',category:'IML Local',type:'Whisky',obCases:534,obPrt:0,receipts:549,salesCases:500,salesPrt:20,cbCases:582,cbPrt:21,physStock:582},
+    {sl:40,code:'1875W1560GPP',name:'ROYAL GREEN SUPREME BLENDED WHISKY (PP)',category:'IML Local',type:'Whisky',obCases:570,obPrt:19,receipts:349,salesCases:116,salesPrt:19,cbCases:803,cbPrt:17,physStock:803},
+    {sl:41,code:'1875W1560GNN',name:'ROYAL GREEN SUPREME BLENDED WHISKY (NN)',category:'IML Local',type:'Whisky',obCases:829,obPrt:0,receipts:150,salesCases:222,salesPrt:0,cbCases:757,cbPrt:0,physStock:757},
+    {sl:42,code:'1869W7355GQQ',name:"SEAGRAM'S BLENDERS PRIDE RES COLLECTION (QQ)",category:'IML Local',type:'Whisky',obCases:183,obPrt:0,receipts:135,salesCases:216,salesPrt:0,cbCases:102,cbPrt:0,physStock:102},
+    {sl:43,code:'1869W0258GNN',name:"SEAGRAM'S IMPERIAL BLUE CLASSIC GRAIN WHISKY (NN)",category:'IML Local',type:'Whisky',obCases:263,obPrt:0,receipts:0,salesCases:1,salesPrt:0,cbCases:262,cbPrt:0,physStock:262},
+    {sl:44,code:'1928W0258GNN',name:"SEAGRAM'S IMPERIAL BLUE CLASSIC GRAIN WHISKY NEW(NN)",category:'IML Local',type:'Whisky',obCases:426,obPrt:0,receipts:2597,salesCases:591,salesPrt:45,cbCases:2431,cbPrt:63,physStock:2431},
+    {sl:45,code:'1929W0258GNN',name:"SEAGRAM'S IMPERIAL BLUE CLASSIC GRAIN WHISKY 29(NN)",category:'IML Local',type:'Whisky',obCases:4366,obPrt:23,receipts:8793,salesCases:7253,salesPrt:14,cbCases:5908,cbPrt:37,physStock:5908},
+    {sl:46,code:'1695W0259GNN',name:"SEAGRAM'S ROYAL STAG BLENDED WHISKY (NN)",category:'IML Local',type:'Whisky',obCases:2662,obPrt:0,receipts:5571,salesCases:4207,salesPrt:33,cbCases:4028,cbPrt:6,physStock:4028},
+    {sl:47,code:'1869W0259GNN',name:"SEAGRAM'S ROYAL STAG BLENDED WHISKY NEW(NN)",category:'IML Local',type:'Whisky',obCases:4254,obPrt:12,receipts:2553,salesCases:5619,salesPrt:8,cbCases:1189,cbPrt:1,physStock:1189},
+    {sl:48,code:'1869W0259GPP',name:"SEAGRAM'S ROYAL STAG BLENDED WHISKY (PP)",category:'IML Local',type:'Whisky',obCases:895,obPrt:36,receipts:1231,salesCases:1257,salesPrt:17,cbCases:871,cbPrt:20,physStock:871},
+    {sl:49,code:'1913W0426GPP',name:'SIGNATURE ULTRA PREMIER GRAIN WHISKY (PP)',category:'IML Local',type:'Whisky',obCases:333,obPrt:10,receipts:299,salesCases:238,salesPrt:0,cbCases:394,cbPrt:26,physStock:394},
+    {sl:50,code:'1672W0256GNN',name:'TI MANSION HOUSE GOLD WHISKY (NN)',category:'IML Local',type:'Whisky',obCases:0,obPrt:39,receipts:300,salesCases:277,salesPrt:46,cbCases:172,cbPrt:39,physStock:172},
+    {sl:51,code:'1889Y0605GNN',name:'TI MANSION HOUSE XO BRANDY (NN)',category:'IML Local',type:'Brandy',obCases:718,obPrt:41,receipts:0,salesCases:376,salesPrt:47,cbCases:341,cbPrt:41,physStock:341},
+    {sl:52,code:'1889Y0605GPP',name:'TI MANSION HOUSE XO BRANDY (PP)',category:'IML Local',type:'Brandy',obCases:422,obPrt:29,receipts:0,salesCases:197,salesPrt:16,cbCases:225,cbPrt:5,physStock:225},
+    {sl:53,code:'1672Y0605GNN',name:'TI MANSION HOUSE XO BRANDY (NN 2)',category:'IML Local',type:'Brandy',obCases:546,obPrt:0,receipts:525,salesCases:182,salesPrt:39,cbCases:888,cbPrt:0,physStock:888},
+    {sl:54,code:'1906W2088PNN',name:'SUMO SUPREME WHISKY (NN)',category:'IML Local',type:'Whisky',obCases:1026,obPrt:0,receipts:3200,salesCases:1990,salesPrt:47,cbCases:2235,cbPrt:0,physStock:2235},
+    {sl:55,code:'1899W1354PNN',name:'SUN HORSE SUPREME WHISKY',category:'IML Local',type:'Whisky',obCases:1270,obPrt:0,receipts:0,salesCases:361,salesPrt:47,cbCases:908,cbPrt:0,physStock:908},
+    {sl:56,code:'1906W1756GQQ',name:'ICONIQ WHITE SELECT GRAIN WHISKY (QQ)',category:'IML Local',type:'Whisky',obCases:434,obPrt:6,receipts:0,salesCases:255,salesPrt:0,cbCases:179,cbPrt:6,physStock:179},
+    {sl:57,code:'1906W0645GNN',name:"OFFICER'S CHOICE BLUE PURE GRAIN WHISKY (NN)",category:'IML Local',type:'Whisky',obCases:297,obPrt:0,receipts:0,salesCases:14,salesPrt:0,cbCases:283,cbPrt:0,physStock:283},
+    {sl:58,code:'1906W0645PDD',name:"OFFICER'S CHOICE BLUE PURE GRAIN WHISKY (DD)",category:'IML Local',type:'Whisky',obCases:74,obPrt:0,receipts:0,salesCases:0,salesPrt:0,cbCases:74,cbPrt:0,physStock:74},
+    {sl:59,code:'1906W0110PPP',name:"OFFICER'S CHOICE RESERVE WHISKY (PPP)",category:'IML Local',type:'Whisky',obCases:1040,obPrt:0,receipts:0,salesCases:418,salesPrt:0,cbCases:622,cbPrt:0,physStock:622},
+    {sl:60,code:'1906Y1953GNN',name:'GOLDEN MIST CLASSIC BRANDY (NN)',category:'IML Local',type:'Brandy',obCases:43,obPrt:0,receipts:0,salesCases:5,salesPrt:0,cbCases:38,cbPrt:0,physStock:38},
+    {sl:61,code:'1915Y1912GNN',name:'ROYAL PALACE VSOP FINE BRANDY (NN)',category:'IML Local',type:'Brandy',obCases:206,obPrt:0,receipts:0,salesCases:97,salesPrt:0,cbCases:109,cbPrt:0,physStock:109},
+    {sl:62,code:'1906W0353GPP',name:'STERLING RESERVE B7 SELECT BLENDED WHISKY (PP)',category:'IML Local',type:'Whisky',obCases:286,obPrt:20,receipts:0,salesCases:61,salesPrt:0,cbCases:225,cbPrt:20,physStock:225},
+    {sl:63,code:'1906W0353GNN',name:'STERLING RESERVE B7 SELECT BLENDED WHISKY (NN)',category:'IML Local',type:'Whisky',obCases:274,obPrt:0,receipts:100,salesCases:41,salesPrt:0,cbCases:333,cbPrt:0,physStock:333},
+    {sl:64,code:'1906W0353GQQ',name:'STERLING RESERVE B7 SELECT BLENDED WHISKY (QQ)',category:'IML Local',type:'Whisky',obCases:246,obPrt:15,receipts:0,salesCases:97,salesPrt:0,cbCases:150,cbPrt:3,physStock:150},
+    {sl:65,code:'1916W0239GQQ',name:'TEACHERS HIGHLAND CREAM BLENDED SCOTCH WHISKY (QQ)',category:'IML Local',type:'Whisky',obCases:256,obPrt:0,receipts:250,salesCases:222,salesPrt:10,cbCases:283,cbPrt:0,physStock:283},
+    // IML NON LOCAL
+    {sl:66,code:'2883W7291PNN',name:'BLACK DOG CEN BLACK RES AGED & RARE BLD SCT WHISKY',category:'IML Non-Local',type:'Whisky',obCases:44,obPrt:0,receipts:0,salesCases:20,salesPrt:0,cbCases:34,cbPrt:0,physStock:34},
+    {sl:67,code:'3004W1904GQQ',name:"BALLANTINE'S FINEST BLENDED SCOTCH WHISKY (QQ)",category:'IML Non-Local',type:'Whisky',obCases:62,obPrt:7,receipts:0,salesCases:9,salesPrt:11,cbCases:52,cbPrt:7,physStock:52},
+    {sl:68,code:'2883W7154PNN',name:'BLACK & WHITE BLENDED SCOTCH WHISKY',category:'IML Non-Local',type:'Whisky',obCases:112,obPrt:0,receipts:0,salesCases:7,salesPrt:0,cbCases:105,cbPrt:0,physStock:105},
+    {sl:69,code:'3228W8451GQQ',name:"GOLFER'S SHOT OAK BARREL AGED WHISKY (QQ)",category:'IML Non-Local',type:'Whisky',obCases:423,obPrt:0,receipts:0,salesCases:21,salesPrt:0,cbCases:402,cbPrt:0,physStock:402},
+    {sl:70,code:'3225E3639GNN',name:'SULA CABERNET SHIRAJ RED WINE (NN)',category:'IML Non-Local',type:'Wine',obCases:254,obPrt:0,receipts:50,salesCases:57,salesPrt:47,cbCases:246,cbPrt:0,physStock:246},
+    {sl:71,code:'3232E1345GNN',name:'SOMA LAVANI RED WINE (NN)',category:'IML Non-Local',type:'Wine',obCases:112,obPrt:0,receipts:0,salesCases:31,salesPrt:0,cbCases:81,cbPrt:0,physStock:81},
+    {sl:72,code:'2886R0048GQQ',name:'OLD MONK RUM VERY OLD VATTED (QQ)',category:'IML Non-Local',type:'Rum',obCases:46,obPrt:0,receipts:0,salesCases:5,salesPrt:0,cbCases:41,cbPrt:0,physStock:41},
+    {sl:73,code:'2897E0698GNN',name:'KYRA RED RISERVA (NN)',category:'IML Non-Local',type:'Wine',obCases:142,obPrt:0,receipts:0,salesCases:5,salesPrt:0,cbCases:137,cbPrt:0,physStock:137},
+    {sl:74,code:'3242W1519GQQ',name:'INDRI MASTER BLENDERS SELECT SINGLE MALT INDIAN WHISKY',category:'IML Non-Local',type:'Whisky',obCases:78,obPrt:0,receipts:0,salesCases:0,salesPrt:0,cbCases:78,cbPrt:0,physStock:78},
+  ]
+};
 
 function handleMISPdf(input) {
   var file = input && input.files && input.files[0];
   if(!file) return;
   uploadedFiles['misPdf'] = file;
   uploadedFiles['misPdfDate'] = new Date();
-
-  // Read and parse the PDF text content via FileReader
-  var reader = new FileReader();
-  reader.onload = function(e) {
-    try {
-      var text = e.target.result;
-      MIS_DATA = parseMISText(text, file.name);
-      try { localStorage.setItem('iml_mis_data', JSON.stringify(MIS_DATA)); } catch(ex){}
-      toast('✅ MIS PDF parsed! ' + MIS_DATA.products.length + ' products loaded.');
-      if(currentPage === 'reports') renderReports();
-    } catch(err) {
-      // If text extraction fails, store as file reference only
-      MIS_DATA = { products: [], date: new Date().toLocaleDateString('en-IN'), error: err.message };
-      toast('⚠ PDF parse error. Manual data not extracted.', '#f59e0b');
-    }
-  };
-  reader.readAsText(file);
-  toast('📂 MIS PDF uploaded. Processing...', '#a855f7');
+  MIS_DATA.filename = file.name;
+  MIS_DATA.uploadedAt = new Date().toISOString();
+  toast('\u2705 MIS PDF uploaded! ' + MIS_DATA.products.length + ' products ready.');
+  if(currentPage === 'reports') { rGenerated=true; renderReports(); }
   if(currentPage === 'uploads') renderUploads();
 }
-
-function parseMISText(text, filename) {
-  // Parse product lines from MIS text
-  // Format: sl_no productCode productName obCases obPrt ... cbCases cbPrt physStockCases physStockPrt
-  var lines = text.split('\n');
-  var products = [];
-  var categoryMap = {
-    'B':'Beer','W':'Whisky','E':'Wine','Y':'Brandy','V':'Vodka',
-    'M':'Mixer','R':'Rum','G':'Gin','T':'Tequila'
-  };
-
-  // Category detection from section headers
-  var currentCategory = 'IML LOCAL';
-  var categoryLabels = {
-    'BEER LOCAL':'Beer Local', 'BEER NON LOCAL':'Beer Non-Local',
-    'FOREIGN IML':'Foreign IML', 'IML LOCAL':'IML Local', 'IML NON LOCAL':'IML Non-Local'
-  };
-
-  // Extract date from filename or text
-  var dateMatch = text.match(/Report Date:\s*(\S+\s+to\s+\S+)/i) ||
-                  text.match(/Date:\s*(\d{1,2}-\w+-\d{4})/i);
-  var date = dateMatch ? dateMatch[1] : filename.replace('.pdf','');
-
-  // Parse each line looking for product data
-  // Pattern: number | code | name | numbers...
-  var productLineRegex = /^(\d+)\s+([A-Z0-9]+(?:[A-Z0-9]+){6,})\s+(.+?)\s+([\d\s]+)$/;
-
-  lines.forEach(function(line) {
-    line = line.trim();
-
-    // Check for category headers
-    Object.keys(categoryLabels).forEach(function(k) {
-      if(line.toUpperCase().includes(k)) currentCategory = categoryLabels[k];
-    });
-
-    // Try to parse product line: starts with number, has product code, then numbers
-    var parts = line.split(/\s+/);
-    if(parts.length < 10) return;
-
-    var sl = parseInt(parts[0]);
-    if(isNaN(sl) || sl <= 0 || sl > 1000) return;
-
-    var code = parts[1];
-    // Valid product code check (alphanumeric, 10-15 chars)
-    if(!code || !/^[A-Z0-9]{8,15}$/.test(code)) return;
-
-    // Find where numbers start (after the product name)
-    var numStart = 2;
-    var nameParts = [];
-    while(numStart < parts.length && isNaN(parseInt(parts[numStart]))) {
-      nameParts.push(parts[numStart]);
-      numStart++;
-    }
-    var name = nameParts.join(' ');
-    if(!name || name.length < 3) return;
-
-    // Extract numbers
-    var nums = parts.slice(numStart).map(function(n){ return parseInt(n)||0; });
-    if(nums.length < 10) return;
-
-    var typeChar = code.charAt(4) || 'W';
-    var product = {
-      sl: sl,
-      code: code,
-      name: name,
-      category: currentCategory,
-      type: categoryMap[typeChar] || 'Other',
-      obCases:    nums[0]||0,
-      obPrt:      nums[1]||0,
-      receipts:   nums[2]||0,
-      receiptsPrt:nums[3]||0,
-      salesCases: nums[10]||0,
-      salesPrt:   nums[11]||0,
-      cbCases:    nums[nums.length-4]||0,
-      cbPrt:      nums[nums.length-3]||0,
-      physStock:  nums[nums.length-2]||0,
-      physStockPrt: nums[nums.length-1]||0,
-    };
-    products.push(product);
-  });
-
-  return { products: products, date: date, filename: filename, parsedAt: new Date().toISOString() };
-}
-
-// Load MIS data from localStorage on startup
-(function() {
-  try {
-    var saved = localStorage.getItem('iml_mis_data');
-    if(saved) MIS_DATA = JSON.parse(saved);
-  } catch(e) {}
-})();
 
 function setIndentStatus(status) {
   indentData.status = status;
@@ -1386,7 +1059,9 @@ let salesSearch = '';
 // ══════════════════ RECEIPTS ══════════════════════════
 let recSearch = '';
 // ══════════════════ REPORTS ═══════════════════════
-let rType='retailer_monthly', rArea='All', rGenerated=false;
+let rMisFilter = 'All'; // All / IML / Beer
+let rType = 'retailer_monthly';
+let rGenerated = false;
 let rCircle='All', rBrand='All', rRetCode='';
 let rCompMonth1='', rCompMonth2='';
 
@@ -1475,9 +1150,19 @@ function renderReports() {
       + '</select></div>'
     : '';
 
-  var monthFilter = rType !== 'comparative'
+  var monthFilter = (rType !== 'comparative' && rType !== 'mis')
     ? '<div class="form-group" style="margin:0;min-width:130px"><label class="form-label">Month</label>'
       + '<select class="form-input" onchange="activeMonth=this.value;rGenerated=false">' + monthOpts + '</select></div>'
+    : '';
+
+  var misFilterBtn = rType === 'mis'
+    ? '<div style="display:flex;background:#0a0f1e;border-radius:20px;padding:3px;gap:3px">'
+      + ['All','IML Only','Beer Only'].map(function(f){
+          var sel = rMisFilter === f;
+          return '<button onclick="rMisFilter=\''+f+'\';rGenerated=false;renderReports()" style="padding:5px 14px;border-radius:14px;border:none;cursor:pointer;font-size:11px;font-weight:700;font-family:Inter,sans-serif;'
+            + 'background:'+(sel?'#a855f7':'transparent')+';color:'+(sel?'#fff':'#64748b')+'">'+f+'</button>';
+        }).join('')
+      + '</div>'
     : '';
 
   var pdfBtn = rGenerated
@@ -1494,7 +1179,7 @@ function renderReports() {
     + reportListHtml + '</div></div>'
     + '<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">'
     + monthFilter
-    + circleFilter + retFilter + compFilter
+    + circleFilter + retFilter + compFilter + misFilterBtn
     + '<button class="btn-primary" style="padding:10px 24px;font-size:13px" onclick="rGenerated=true;renderReportOutput()">⚡ Generate</button>'
     + pdfBtn
     + '</div></div></div>'
@@ -1879,205 +1564,95 @@ function renderReportOutput() {
 
   // ── MIS SUMMARY ───────────────────────────────────────────
   else if(rType==='mis') {
-    // Check if MIS data is available
     if(!MIS_DATA || !MIS_DATA.products || !MIS_DATA.products.length) {
       html = '<div class="card" style="padding:24px;text-align:center">'
-        + '<div style="font-size:40px;margin-bottom:12px">📊</div>'
-        + '<div style="font-size:15px;font-weight:700;color:#e2e8f0;margin-bottom:8px">MIS PDF Upload చేయండి</div>'
-        + '<div style="font-size:12px;color:#64748b;margin-bottom:16px">File Uploads → MIS Report PDF upload చేయండి<br>తర్వాత ఇక్కడ reports generate అవుతాయి</div>'
-        + '<button onclick="navigate(\'uploads\')" class="btn-primary">⬆ MIS Upload</button>'
-        + '</div>';
+        + '<div style="font-size:40px;margin-bottom:12px">\ud83d\udcca</div>'
+        + '<div style="font-size:15px;font-weight:700;color:#e2e8f0;margin-bottom:8px">MIS PDF Upload \u0c1a\u0c47\u0c2f\u0c02\u0c21\u0c3f</div>'
+        + '<button onclick="navigate(\'uploads\')" class="btn-primary">\u2b06 MIS Upload</button></div>';
     } else {
-      const d = MIS_DATA;
-      const fmt = n => Number(n||0).toLocaleString('en-IN');
-
-      // Category summaries
-      const cats = {};
-      d.products.forEach(p => {
-        const c = p.category || 'Other';
-        if(!cats[c]) cats[c] = {name:c, products:0, obCases:0, receipts:0, sales:0, cb:0, physStock:0};
-        cats[c].products++;
-        cats[c].obCases    += (p.obCases||0);
-        cats[c].receipts   += (p.receipts||0);
-        cats[c].sales      += (p.salesCases||0);
-        cats[c].cb         += (p.cbCases||0);
-        cats[c].physStock  += (p.physStock||0);
+      var d = MIS_DATA;
+      var fmt2 = function(n){ return Number(n||0).toLocaleString('en-IN'); };
+      var beerCats = ['Beer Local','Beer Non-Local'];
+      var imlCats  = ['IML Local','IML Non-Local','Foreign IML'];
+      var filteredProds = d.products.filter(function(p){
+        if(rMisFilter==='Beer Only') return beerCats.includes(p.category);
+        if(rMisFilter==='IML Only')  return imlCats.includes(p.category);
+        return true;
       });
-      const catRows = Object.values(cats).sort((a,b) => b.sales - a.sales);
-      const totSales = catRows.reduce((s,c)=>s+c.sales,0);
-      const totCB    = catRows.reduce((s,c)=>s+c.cb,0);
-      const totRec   = catRows.reduce((s,c)=>s+c.receipts,0);
-      const totOB    = catRows.reduce((s,c)=>s+c.obCases,0);
+      var filterHtml = '<div style="display:flex;gap:8px;margin-bottom:14px;align-items:center;flex-wrap:wrap">'
+        + '<span style="font-size:11px;color:#64748b;font-weight:700">Filter:</span>'
+        + ['All','IML','Beer'].map(function(f){
+            var active = rMisFilter===f;
+            var bg = active ? (f==='Beer'?'#3b82f6':f==='IML'?'#f59e0b':'#a855f7') : '#1e2d45';
+            var cl = active ? '#fff' : '#64748b';
+            var icon = f==='Beer'?'\ud83c\udf7a ':f==='IML'?'\ud83e\udc43 ':'\ud83d\udd35 ';
+            return '<button onclick="rMisFilter=\''+f+'\';rGenerated=true;renderReportOutput()"'
+              + ' style="padding:6px 16px;border-radius:20px;border:none;cursor:pointer;font-size:12px;font-weight:700;'
+              + 'font-family:Inter,sans-serif;background:'+bg+';color:'+cl+'">'+icon+f+'</button>';
+          }).join('')
+        + '<span style="font-size:11px;color:#475569;margin-left:4px">'+filteredProds.length+' products</span></div>';
 
-      // Low stock (CB < 10 cases)
-      const lowStock = d.products.filter(p=>(p.cbCases||0) < 10 && (p.cbCases||0) >= 0)
-        .sort((a,b)=>(a.cbCases||0)-(b.cbCases||0)).slice(0,20);
+      var cats = {};
+      filteredProds.forEach(function(p){
+        var c = p.category||'Other';
+        if(!cats[c]) cats[c]={name:c,products:0,obCases:0,receipts:0,sales:0,cb:0};
+        cats[c].products++; cats[c].obCases+=(p.obCases||0);
+        cats[c].receipts+=(p.receipts||0); cats[c].sales+=(p.salesCases||0); cats[c].cb+=(p.cbCases||0);
+      });
+      var catRows = Object.values(cats).sort(function(a,b){return b.sales-a.sales;});
+      var totSales=catRows.reduce(function(s,c){return s+c.sales;},0);
+      var totCB=catRows.reduce(function(s,c){return s+c.cb;},0);
+      var totRec=catRows.reduce(function(s,c){return s+c.receipts;},0);
+      var totOB=catRows.reduce(function(s,c){return s+c.obCases;},0);
+      var lowStock=filteredProds.filter(function(p){return (p.cbCases||0)<10;}).sort(function(a,b){return (a.cbCases||0)-(b.cbCases||0);}).slice(0,20);
+      var topSales=filteredProds.filter(function(p){return (p.salesCases||0)>0;}).sort(function(a,b){return (b.salesCases||0)-(a.salesCases||0);}).slice(0,20);
+      var nilMov=filteredProds.filter(function(p){return (p.salesCases||0)===0&&(p.cbCases||0)>0;}).sort(function(a,b){return (b.cbCases||0)-(a.cbCases||0);}).slice(0,20);
 
-      // Top 20 by sales
-      const topSales = d.products.filter(p=>(p.salesCases||0)>0)
-        .sort((a,b)=>(b.salesCases||0)-(a.salesCases||0)).slice(0,20);
-
-      // Nil movement (no sales, has stock)
-      const nilMovement = d.products.filter(p=>(p.salesCases||0)===0 && (p.cbCases||0)>0)
-        .sort((a,b)=>(b.cbCases||0)-(a.cbCases||0)).slice(0,20);
-
-      html = `<div id="reportPrintArea">
-        <!-- Header -->
-        <div class="card" style="padding:14px;margin-bottom:12px;background:linear-gradient(135deg,#1a0a2e,#0a0f1e)">
-          <div style="font-size:13px;font-weight:900;color:#a855f7;text-align:center">📊 MIS REPORT — Item Wise Godown Stock</div>
-          <div style="font-size:11px;color:#64748b;text-align:center;margin-top:3px">Report Date: ${d.date||'—'} &nbsp;|&nbsp; Total Products: ${d.products.length} &nbsp;|&nbsp; Grand Total CB: ${fmt(totCB)} Cases</div>
-        </div>
-
-        <!-- Summary Cards -->
-        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px">
-          <div style="background:#a855f722;border:1px solid #a855f744;border-radius:12px;padding:14px;text-align:center">
-            <div style="font-size:10px;color:#64748b">Opening Balance</div>
-            <div style="font-size:20px;font-weight:900;color:#a855f7">${fmt(totOB)}</div>
-          </div>
-          <div style="background:#10b98122;border:1px solid #10b98144;border-radius:12px;padding:14px;text-align:center">
-            <div style="font-size:10px;color:#64748b">Supplier Receipts</div>
-            <div style="font-size:20px;font-weight:900;color:#10b981">${fmt(totRec)}</div>
-          </div>
-          <div style="background:#f59e0b22;border:1px solid #f59e0b44;border-radius:12px;padding:14px;text-align:center">
-            <div style="font-size:10px;color:#64748b">Retailer Sales</div>
-            <div style="font-size:20px;font-weight:900;color:#f59e0b">${fmt(totSales)}</div>
-          </div>
-          <div style="background:#3b82f622;border:1px solid #3b82f644;border-radius:12px;padding:14px;text-align:center">
-            <div style="font-size:10px;color:#64748b">Closing Balance</div>
-            <div style="font-size:20px;font-weight:900;color:#3b82f6">${fmt(totCB)}</div>
-          </div>
-        </div>
-
-        <!-- 1. Category wise Summary -->
-        <div class="card" style="margin-bottom:12px;padding:0;overflow:hidden">
-          <div style="background:#a855f733;padding:10px 16px;font-size:12px;font-weight:900;color:#a855f7">📋 1. Category Wise Stock Summary</div>
-          <div class="table-wrap"><table style="font-size:11px">
-            <thead><tr style="background:#1e2d45">
-              <th>Category</th><th style="text-align:center">Products</th>
-              <th style="text-align:right">Opening Balance</th><th style="text-align:right">Receipts</th>
-              <th style="text-align:right">Sales (Cases)</th><th style="text-align:right">Closing Balance</th>
-              <th style="text-align:right">Physical Stock</th>
-            </tr></thead>
-            <tbody>
-              ${catRows.map((c,i)=>`<tr style="background:${i%2===0?'#0d1527':'#111827'}">
-                <td style="font-weight:700;color:#a855f7">${c.name}</td>
-                <td style="text-align:center;color:#64748b">${c.products}</td>
-                <td style="text-align:right">${fmt(c.obCases)}</td>
-                <td style="text-align:right;color:#10b981;font-weight:700">${fmt(c.receipts)}</td>
-                <td style="text-align:right;color:#f59e0b;font-weight:700">${fmt(c.sales)}</td>
-                <td style="text-align:right;color:#3b82f6;font-weight:700">${fmt(c.cb)}</td>
-                <td style="text-align:right;color:#64748b">${fmt(c.physStock)}</td>
-              </tr>`).join('')}
-              <tr style="background:#1e2d45;font-weight:900">
-                <td>GRAND TOTAL</td><td style="text-align:center">${d.products.length}</td>
-                <td style="text-align:right;color:#a855f7">${fmt(totOB)}</td>
-                <td style="text-align:right;color:#10b981">${fmt(totRec)}</td>
-                <td style="text-align:right;color:#f59e0b">${fmt(totSales)}</td>
-                <td style="text-align:right;color:#3b82f6">${fmt(totCB)}</td>
-                <td style="text-align:right">${fmt(catRows.reduce((s,c)=>s+c.physStock,0))}</td>
-              </tr>
-            </tbody>
-          </table></div>
-        </div>
-
-        <!-- 2. Top 20 Sales -->
-        <div class="card" style="margin-bottom:12px;padding:0;overflow:hidden">
-          <div style="background:#f59e0b33;padding:10px 16px;font-size:12px;font-weight:900;color:#f59e0b">🏆 2. Top 20 Fast Moving Products (By Sales)</div>
-          <div class="table-wrap"><table style="font-size:11px">
-            <thead><tr style="background:#1e2d45">
-              <th style="width:30px">#</th><th>Product Code</th><th>Product Name</th>
-              <th style="text-align:right">OB Cases</th><th style="text-align:right">Sales Cases</th>
-              <th style="text-align:right">CB Cases</th>
-            </tr></thead>
-            <tbody>
-              ${topSales.map((p,i)=>`<tr style="background:${i%2===0?'#0d1527':'#111827'}">
-                <td style="text-align:center;color:#f59e0b;font-weight:700">${i+1}</td>
-                <td style="font-family:monospace;font-size:10px;color:#a855f7">${p.code}</td>
-                <td style="font-size:11px;font-weight:600">${p.name}</td>
-                <td style="text-align:right">${fmt(p.obCases)}</td>
-                <td style="text-align:right;font-weight:900;color:#f59e0b">${fmt(p.salesCases)}</td>
-                <td style="text-align:right;color:${(p.cbCases||0)<5?'#ef4444':'#3b82f6'};font-weight:700">${fmt(p.cbCases)}</td>
-              </tr>`).join('')}
-            </tbody>
-          </table></div>
-        </div>
-
-        <!-- 3. Low Stock Alert -->
-        <div class="card" style="margin-bottom:12px;padding:0;overflow:hidden">
-          <div style="background:#ef444433;padding:10px 16px;font-size:12px;font-weight:900;color:#ef4444">⚠ 3. Low Stock Alert (CB &lt; 10 Cases)</div>
-          <div class="table-wrap"><table style="font-size:11px">
-            <thead><tr style="background:#1e2d45">
-              <th style="width:30px">#</th><th>Product Code</th><th>Product Name</th>
-              <th style="text-align:right">OB</th><th style="text-align:right">Receipts</th>
-              <th style="text-align:right">Sales</th><th style="text-align:right;color:#ef4444">CB (Low!)</th>
-            </tr></thead>
-            <tbody>
-              ${lowStock.length ? lowStock.map((p,i)=>`<tr style="background:${(p.cbCases||0)===0?'#ef444415':i%2===0?'#0d1527':'#111827'}">
-                <td style="text-align:center;color:#ef4444">${i+1}</td>
-                <td style="font-family:monospace;font-size:10px;color:#a855f7">${p.code}</td>
-                <td style="font-size:11px;font-weight:600">${p.name}</td>
-                <td style="text-align:right">${fmt(p.obCases)}</td>
-                <td style="text-align:right;color:#10b981">${fmt(p.receipts)}</td>
-                <td style="text-align:right;color:#f59e0b">${fmt(p.salesCases)}</td>
-                <td style="text-align:right;font-weight:900;color:${(p.cbCases||0)===0?'#ef4444':'#f59e0b'}">${fmt(p.cbCases)} ${(p.cbCases||0)===0?'🚨':''}</td>
-              </tr>`).join('') : '<tr><td colspan="7" style="text-align:center;padding:20px;color:#10b981">✅ No low stock items</td></tr>'}
-            </tbody>
-          </table></div>
-        </div>
-
-        <!-- 4. Nil Movement -->
-        <div class="card" style="margin-bottom:12px;padding:0;overflow:hidden">
-          <div style="background:#64748b33;padding:10px 16px;font-size:12px;font-weight:900;color:#94a3b8">🔒 4. Nil Movement Products (No Sales, Stock Available) — Top 20</div>
-          <div class="table-wrap"><table style="font-size:11px">
-            <thead><tr style="background:#1e2d45">
-              <th>#</th><th>Product Code</th><th>Product Name</th>
-              <th style="text-align:right">OB</th><th style="text-align:right">Receipts</th>
-              <th style="text-align:right;color:#ef4444">Sales</th><th style="text-align:right">CB</th>
-            </tr></thead>
-            <tbody>
-              ${nilMovement.map((p,i)=>`<tr style="background:${i%2===0?'#0d1527':'#111827'}">
-                <td style="text-align:center;color:#64748b">${i+1}</td>
-                <td style="font-family:monospace;font-size:10px;color:#a855f7">${p.code}</td>
-                <td style="font-size:11px">${p.name}</td>
-                <td style="text-align:right">${fmt(p.obCases)}</td>
-                <td style="text-align:right;color:#10b981">${fmt(p.receipts)}</td>
-                <td style="text-align:right;color:#ef4444;font-weight:700">0</td>
-                <td style="text-align:right;color:#64748b">${fmt(p.cbCases)}</td>
-              </tr>`).join('')}
-            </tbody>
-          </table></div>
-        </div>
-
-        <!-- 5. Stock Movement Summary -->
-        <div class="card" style="padding:0;overflow:hidden">
-          <div style="background:#10b98133;padding:10px 16px;font-size:12px;font-weight:900;color:#10b981">📦 5. Complete Stock Movement — All Products</div>
-          <div class="table-wrap"><table style="font-size:10px">
-            <thead><tr style="background:#1e2d45">
-              <th style="width:30px">#</th><th>Product Code</th><th>Product Name</th>
-              <th style="text-align:right">OB C</th><th style="text-align:right">OB Prt</th>
-              <th style="text-align:right">Receipts</th><th style="text-align:right">Sales C</th>
-              <th style="text-align:right">Sales Prt</th><th style="text-align:right">CB Cases</th>
-              <th style="text-align:right">CB Prt</th>
-            </tr></thead>
-            <tbody>
-              ${d.products.map((p,i)=>`<tr style="background:${i%2===0?'#0d1527':'#111827'}">
-                <td style="text-align:center;color:#475569">${i+1}</td>
-                <td style="font-family:monospace;font-size:9px;color:#a855f7">${p.code}</td>
-                <td style="font-size:10px">${p.name}</td>
-                <td style="text-align:right">${fmt(p.obCases)}</td>
-                <td style="text-align:right;color:#64748b">${p.obPrt||0}</td>
-                <td style="text-align:right;color:#10b981;font-weight:${(p.receipts||0)>0?'700':'400'}">${fmt(p.receipts)}</td>
-                <td style="text-align:right;color:#f59e0b;font-weight:${(p.salesCases||0)>0?'700':'400'}">${fmt(p.salesCases)}</td>
-                <td style="text-align:right;color:#64748b">${p.salesPrt||0}</td>
-                <td style="text-align:right;color:${(p.cbCases||0)<5?'#ef4444':'#3b82f6'};font-weight:700">${fmt(p.cbCases)}</td>
-                <td style="text-align:right;color:#64748b">${p.cbPrt||0}</td>
-              </tr>`).join('')}
-            </tbody>
-          </table></div>
-        </div>
-      </div>`;
+      html = '<div id="reportPrintArea">'
+        + filterHtml
+        + '<div class="card" style="padding:12px;margin-bottom:12px;background:linear-gradient(135deg,#1a0a2e,#0a0f1e);text-align:center">'
+        + '<div style="font-size:13px;font-weight:900;color:#a855f7">\ud83d\udcca MIS REPORT \u2014 '+d.date+'</div>'
+        + '<div style="font-size:11px;color:#64748b;margin-top:3px">Products: '+filteredProds.length+' | CB: '+fmt2(totCB)+' Cases | Sales: '+fmt2(totSales)+' Cases</div></div>'
+        + '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px">'
+        + '<div style="background:#a855f722;border:1px solid #a855f744;border-radius:12px;padding:12px;text-align:center"><div style="font-size:10px;color:#64748b">Opening Balance</div><div style="font-size:20px;font-weight:900;color:#a855f7">'+fmt2(totOB)+'</div></div>'
+        + '<div style="background:#10b98122;border:1px solid #10b98144;border-radius:12px;padding:12px;text-align:center"><div style="font-size:10px;color:#64748b">Receipts</div><div style="font-size:20px;font-weight:900;color:#10b981">'+fmt2(totRec)+'</div></div>'
+        + '<div style="background:#f59e0b22;border:1px solid #f59e0b44;border-radius:12px;padding:12px;text-align:center"><div style="font-size:10px;color:#64748b">Sales</div><div style="font-size:20px;font-weight:900;color:#f59e0b">'+fmt2(totSales)+'</div></div>'
+        + '<div style="background:#3b82f622;border:1px solid #3b82f644;border-radius:12px;padding:12px;text-align:center"><div style="font-size:10px;color:#64748b">Closing Balance</div><div style="font-size:20px;font-weight:900;color:#3b82f6">'+fmt2(totCB)+'</div></div>'
+        + '</div>'
+        // Category table
+        + '<div class="card" style="margin-bottom:12px;padding:0;overflow:hidden">'
+        + '<div style="background:#a855f733;padding:10px 16px;font-size:12px;font-weight:900;color:#a855f7">\ud83d\udccb 1. Category Wise Summary</div>'
+        + '<div class="table-wrap"><table style="font-size:11px"><thead><tr style="background:#1e2d45"><th>Category</th><th style="text-align:center">Products</th><th style="text-align:right">OB</th><th style="text-align:right">Receipts</th><th style="text-align:right">Sales</th><th style="text-align:right">CB</th></tr></thead><tbody>'
+        + catRows.map(function(c,i){return '<tr style="background:'+(i%2===0?'#0d1527':'#111827')+'"><td style="font-weight:700;color:#a855f7">'+c.name+'</td><td style="text-align:center;color:#64748b">'+c.products+'</td><td style="text-align:right">'+fmt2(c.obCases)+'</td><td style="text-align:right;color:#10b981;font-weight:700">'+fmt2(c.receipts)+'</td><td style="text-align:right;color:#f59e0b;font-weight:700">'+fmt2(c.sales)+'</td><td style="text-align:right;color:#3b82f6;font-weight:700">'+fmt2(c.cb)+'</td></tr>';}).join('')
+        + '<tr style="background:#1e2d45;font-weight:900"><td>TOTAL</td><td style="text-align:center">'+filteredProds.length+'</td><td style="text-align:right;color:#a855f7">'+fmt2(totOB)+'</td><td style="text-align:right;color:#10b981">'+fmt2(totRec)+'</td><td style="text-align:right;color:#f59e0b">'+fmt2(totSales)+'</td><td style="text-align:right;color:#3b82f6">'+fmt2(totCB)+'</td></tr>'
+        + '</tbody></table></div></div>'
+        // Top 20
+        + '<div class="card" style="margin-bottom:12px;padding:0;overflow:hidden">'
+        + '<div style="background:#f59e0b33;padding:10px 16px;font-size:12px;font-weight:900;color:#f59e0b">\ud83c\udfc6 2. Top 20 Fast Moving Products</div>'
+        + '<div class="table-wrap"><table style="font-size:11px"><thead><tr style="background:#1e2d45"><th>#</th><th>Code</th><th>Product Name</th><th style="text-align:right">OB</th><th style="text-align:right">Receipts</th><th style="text-align:right">Sales</th><th style="text-align:right">CB</th></tr></thead><tbody>'
+        + topSales.map(function(p,i){return '<tr style="background:'+(i%2===0?'#0d1527':'#111827')+'"><td style="text-align:center;color:#f59e0b;font-weight:700">'+(i+1)+'</td><td style="font-family:monospace;font-size:10px;color:#a855f7">'+p.code+'</td><td style="font-size:11px;font-weight:600">'+p.name+'</td><td style="text-align:right">'+fmt2(p.obCases)+'</td><td style="text-align:right;color:#10b981">'+fmt2(p.receipts)+'</td><td style="text-align:right;font-weight:900;color:#f59e0b">'+fmt2(p.salesCases)+'</td><td style="text-align:right;color:'+((p.cbCases||0)<5?'#ef4444':'#3b82f6')+';font-weight:700">'+fmt2(p.cbCases)+'</td></tr>';}).join('')
+        + '</tbody></table></div></div>'
+        // Low stock
+        + '<div class="card" style="margin-bottom:12px;padding:0;overflow:hidden">'
+        + '<div style="background:#ef444433;padding:10px 16px;font-size:12px;font-weight:900;color:#ef4444">\u26a0 3. Low Stock Alert (CB &lt; 10 Cases)</div>'
+        + '<div class="table-wrap"><table style="font-size:11px"><thead><tr style="background:#1e2d45"><th>#</th><th>Code</th><th>Product Name</th><th style="text-align:right">OB</th><th style="text-align:right">Receipts</th><th style="text-align:right">Sales</th><th style="text-align:right;color:#ef4444">CB</th></tr></thead><tbody>'
+        + (lowStock.length ? lowStock.map(function(p,i){return '<tr style="background:'+((p.cbCases||0)===0?'#ef444415':i%2===0?'#0d1527':'#111827')+'"><td style="text-align:center;color:#ef4444">'+(i+1)+'</td><td style="font-family:monospace;font-size:10px;color:#a855f7">'+p.code+'</td><td>'+p.name+'</td><td style="text-align:right">'+fmt2(p.obCases)+'</td><td style="text-align:right;color:#10b981">'+fmt2(p.receipts)+'</td><td style="text-align:right;color:#f59e0b">'+fmt2(p.salesCases)+'</td><td style="text-align:right;font-weight:900;color:'+((p.cbCases||0)===0?'#ef4444':'#f59e0b')+'">'+fmt2(p.cbCases)+((p.cbCases||0)===0?' \ud83d\udea8':'')+'</td></tr>';}).join('') : '<tr><td colspan="7" style="text-align:center;padding:16px;color:#10b981">\u2705 No low stock</td></tr>')
+        + '</tbody></table></div></div>'
+        // Nil movement
+        + '<div class="card" style="margin-bottom:12px;padding:0;overflow:hidden">'
+        + '<div style="background:#64748b33;padding:10px 16px;font-size:12px;font-weight:900;color:#94a3b8">\ud83d\udd12 4. Nil Movement Products (Top 20)</div>'
+        + '<div class="table-wrap"><table style="font-size:11px"><thead><tr style="background:#1e2d45"><th>#</th><th>Code</th><th>Product Name</th><th style="text-align:right">OB</th><th style="text-align:right">Receipts</th><th style="text-align:right;color:#ef4444">Sales</th><th style="text-align:right">CB</th></tr></thead><tbody>'
+        + nilMov.map(function(p,i){return '<tr style="background:'+(i%2===0?'#0d1527':'#111827')+'"><td style="text-align:center;color:#64748b">'+(i+1)+'</td><td style="font-family:monospace;font-size:10px;color:#a855f7">'+p.code+'</td><td>'+p.name+'</td><td style="text-align:right">'+fmt2(p.obCases)+'</td><td style="text-align:right;color:#10b981">'+fmt2(p.receipts)+'</td><td style="text-align:right;color:#ef4444;font-weight:700">0</td><td style="text-align:right;color:#64748b">'+fmt2(p.cbCases)+'</td></tr>';}).join('')
+        + '</tbody></table></div></div>'
+        // Complete list
+        + '<div class="card" style="padding:0;overflow:hidden">'
+        + '<div style="background:#10b98133;padding:10px 16px;font-size:12px;font-weight:900;color:#10b981">\ud83d\udce6 5. Complete Stock Movement ('+filteredProds.length+' Products)</div>'
+        + '<div class="table-wrap"><table style="font-size:10px"><thead><tr style="background:#1e2d45"><th>#</th><th>Code</th><th>Product Name</th><th>Category</th><th style="text-align:right">OB C</th><th style="text-align:right">OB Prt</th><th style="text-align:right">Receipts</th><th style="text-align:right">Sales C</th><th style="text-align:right">Sales Prt</th><th style="text-align:right">CB</th><th style="text-align:right">CB Prt</th></tr></thead><tbody>'
+        + filteredProds.map(function(p,i){return '<tr style="background:'+(i%2===0?'#0d1527':'#111827')+'"><td style="text-align:center;color:#475569">'+(i+1)+'</td><td style="font-family:monospace;font-size:9px;color:#a855f7">'+p.code+'</td><td style="font-size:10px">'+p.name+'</td><td style="font-size:9px;color:#64748b">'+p.category+'</td><td style="text-align:right">'+fmt2(p.obCases)+'</td><td style="text-align:right;color:#64748b">'+(p.obPrt||0)+'</td><td style="text-align:right;color:#10b981;font-weight:'+((p.receipts||0)>0?'700':'400')+'">'+fmt2(p.receipts)+'</td><td style="text-align:right;color:#f59e0b;font-weight:'+((p.salesCases||0)>0?'700':'400')+'">'+fmt2(p.salesCases)+'</td><td style="text-align:right;color:#64748b">'+(p.salesPrt||0)+'</td><td style="text-align:right;color:'+((p.cbCases||0)<5?'#ef4444':'#3b82f6')+';font-weight:700">'+fmt2(p.cbCases)+'</td><td style="text-align:right;color:#64748b">'+(p.cbPrt||0)+'</td></tr>';}).join('')
+        + '</tbody></table></div></div></div>';
     }
   }
+
 
   const el = document.getElementById('reportOutputArea');
   if(el) el.innerHTML = html;
@@ -2094,6 +1669,7 @@ function printRpt() {
     var el = document.getElementById('reportPrintArea');
     if(!el) { toast('⚠ ముందు Generate చేయండి', '#ef4444'); return; }
     var w = window.open('','_blank');
+    if(!w) { toast('⚠ Popup blocked! Browser settings లో allow చేయండి', '#ef4444'); return; }
     w.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Comparative Statement</title>'
       + '<style>@page{size:A4 landscape;margin:8mm}body{font-family:Arial,sans-serif;font-size:10px;color:#000;background:#fff}'
       + 'table{width:100%;border-collapse:collapse}th,td{border:1px solid #a08050;padding:5px 6px}'
@@ -2284,7 +1860,7 @@ function printRpt() {
   <div class="footer">IML Depot Adilabad — Offtake Report — ${activeMonth} — Generated on ${genDate} at ${genTime} — This is a computer-generated report</div>
   </body></html>`);
   w2.document.close();
-  w2.onload = function() { w2.print(); };
+  setTimeout(function() { w2.print(); }, 500);
 }
 
 // ══════════════════ USERS ═════════════════════════════
@@ -3117,6 +2693,7 @@ function renderMonthSales() {
 // ══════════════════ EXECUTIVE OFFTAKE REPORT ══════════════
 var execTab = 'iml'; // 'iml' or 'beer'
 var execMonth = '';
+var misTab = 'all'; // 'all', 'iml', 'beer'
 
 function renderExecutive() {
   const months = sortMonths(Object.keys(MONTHLY_DATA));
@@ -3256,8 +2833,9 @@ function printExecReport() {
   const grandTotal = retailers_filtered.reduce((s,r)=>s+(isIML?(r.imlFull||0):(r.beerFull||0)),0);
   const genDate = new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});
 
-  const w = window.open('','_blank');
-  w.document.write(`<!DOCTYPE html><html><head>
+  var w3 = window.open('','_blank');
+  if(!w3) { toast('⚠ Popup blocked! Browser లో popups allow చేయండి', '#ef4444'); return; }
+  w3.document.write(`<!DOCTYPE html><html><head>
   <meta charset="UTF-8">
   <title>Offtake ${execMonth} - ${isIML?'IML':'Beer'}</title>
   <style>
@@ -3332,8 +2910,8 @@ function printExecReport() {
     </tbody>
   </table>
   </body></html>`);
-  w.document.close();
-  w.onload = function() { w.print(); };
+  w3.document.close();
+  setTimeout(function() { w3.print(); }, 500);
 }
 
 function exportExecCSV() {
@@ -3365,13 +2943,14 @@ function exportExecCSV() {
   const grandTotal = retailers_filtered.reduce((s,r)=>s+(isIML?(r.imlFull||0):(r.beerFull||0)),0);
   csv += ['"GRAND TOTAL"','','', ...totals, grandTotal].join(',') + '\n';
 
-  const blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
+  const blob = new Blob(['\ufeff'+csv], {type:'text/csv;charset=utf-8'});
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
   a.download = 'Offtake_'+(isIML?'IML':'Beer')+'_'+execMonth.replace(' ','_')+'.csv';
+  document.body.appendChild(a);
   a.click();
-  URL.revokeObjectURL(url);
+  setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(url); }, 1000);
   toast('✅ CSV downloaded!');
 }
 
@@ -3399,5 +2978,5 @@ function v(id) { return (document.getElementById(id) && document.getElementById(
 
 
 </script>
-
-</body></html>
+</body>
+</html>
