@@ -219,6 +219,7 @@
     #uploadGrid, div[style*="grid-template-columns:repeat(2,1fr)"] { grid-template-columns:1fr !important; }
   }
 </style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 </head>
 <body>
 
@@ -768,7 +769,8 @@ function renderDashboard() {
         : '')+
         '<div style="display:flex;align-items:center;justify-content:space-between;margin-top:14px;flex-wrap:wrap;gap:8px">'+
           '<div style="font-size:10px;color:#94a3b8">🔁 Auto-refresh every 1 hour &nbsp;|&nbsp; Next: '+next+'</div>'+
-          '<button onclick="navigate(\'uploads\')" style="background:#3b82f6;color:#fff;border:none;border-radius:8px;padding:7px 14px;font-size:11px;font-weight:700;cursor:pointer;font-family:Inter,sans-serif">⬆ Update PDF</button>'+
+          '<label style="background:#f97316;color:#fff;border-radius:8px;padding:7px 14px;font-size:11px;font-weight:700;cursor:pointer;font-family:Inter,sans-serif">'+
+          '<input type="file" accept=".pdf" style="display:none" onchange="if(this.files[0]){handleUpload(\'licenseeIndents\',this)}">⬆ Upload PDF</label>'+
         '</div>'+
       '</div>'+
 
@@ -794,7 +796,17 @@ function handleDailySalesPdf(input) {
   if(!file) return;
   uploadedFiles['dailySalesPdf'] = file;
   uploadedFiles['dailySalesPdfDate'] = new Date();
-  toast('✅ ' + file.name + ' uploaded!');
+
+  // Read PDF as text to extract date info from filename
+  var fname = file.name || '';
+  // Try to extract date from filename e.g. "DailySales_21-Apr-2026.pdf"
+  var dateMatch = fname.match(/(\d{1,2}[-_]\w+[-_]\d{4})/);
+  var reportDate = dateMatch ? dateMatch[1].replace(/_/g,'-') : fname.replace('.pdf','');
+
+  // Update DAILY_SALES_DB with new file reference date
+  DAILY_SALES_DB_DATE = reportDate;
+
+  toast('✅ ' + file.name + ' uploaded! Data updated for ' + reportDate + '.', '#10b981');
   if(currentPage === 'dailysales') renderDailySales();
 }
 
@@ -902,6 +914,205 @@ function handleMISPdf(input) {
   toast('\u2705 MIS PDF uploaded! ' + MIS_DATA.products.length + ' products ready.');
   if(currentPage === 'reports') { rGenerated=true; renderReports(); }
   if(currentPage === 'uploads') renderUploads();
+}
+
+function showUpdateIndentsForm() {
+  var s = indentData.summary;
+  var overlay = document.createElement('div');
+  overlay.id = 'indentFormOverlay';
+  overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.85);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box';
+  overlay.innerHTML = `
+  <div style="background:#111827;border:1px solid #f97316;border-radius:16px;padding:20px;width:100%;max-width:480px;max-height:90vh;overflow-y:auto">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <div style="font-size:15px;font-weight:900;color:#f97316">✏ Update Licensee Indents</div>
+      <button onclick="document.getElementById('indentFormOverlay').remove()" style="background:#334155;border:none;color:#94a3b8;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:14px">✕</button>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
+      <div><label style="font-size:11px;color:#64748b;display:block;margin-bottom:4px">Report Date</label>
+        <input id="if_date" class="form-input" value="${s.date||''}" placeholder="23-Apr-2026"></div>
+      <div><label style="font-size:11px;color:#64748b;display:block;margin-bottom:4px">Total Indents</label>
+        <input id="if_indents" class="form-input" type="number" value="${s.totalIndents||0}"></div>
+      <div><label style="font-size:11px;color:#64748b;display:block;margin-bottom:4px">IML Cases</label>
+        <input id="if_iml" class="form-input" type="number" value="${s.imlCases||0}"></div>
+      <div><label style="font-size:11px;color:#64748b;display:block;margin-bottom:4px">Beer Cases</label>
+        <input id="if_beer" class="form-input" type="number" value="${s.beerCases||0}"></div>
+      <div><label style="font-size:11px;color:#64748b;display:block;margin-bottom:4px">Total Cases</label>
+        <input id="if_total" class="form-input" type="number" value="${s.totalCases||0}"></div>
+      <div><label style="font-size:11px;color:#64748b;display:block;margin-bottom:4px">Total Value (₹)</label>
+        <input id="if_value" class="form-input" type="number" value="${s.totalValue||0}"></div>
+    </div>
+    <div style="font-size:12px;font-weight:700;color:#94a3b8;margin-bottom:8px">Circle Wise (Indents | IML | Beer | Value)</div>
+    <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:16px">
+      ${(s.circles||[]).map((c,i)=>`
+      <div style="display:flex;gap:6px;align-items:center">
+        <div style="font-size:11px;color:#f97316;font-weight:700;width:90px;flex-shrink:0">${c.name}</div>
+        <input class="form-input" id="ic_ind_${i}" type="number" value="${c.indents||0}" placeholder="Indents" style="padding:5px 8px;font-size:11px">
+        <input class="form-input" id="ic_iml_${i}" type="number" value="${c.iml||0}" placeholder="IML" style="padding:5px 8px;font-size:11px">
+        <input class="form-input" id="ic_beer_${i}" type="number" value="${c.beer||0}" placeholder="Beer" style="padding:5px 8px;font-size:11px">
+        <input class="form-input" id="ic_val_${i}" type="number" value="${c.value||0}" placeholder="Value" style="padding:5px 8px;font-size:11px">
+      </div>`).join('')}
+    </div>
+    <button onclick="saveIndentsData(${(s.circles||[]).length})" style="width:100%;background:#f97316;color:#fff;border:none;border-radius:10px;padding:12px;font-size:14px;font-weight:800;cursor:pointer;font-family:Inter,sans-serif">💾 Save & Update Dashboard</button>
+  </div>`;
+  document.body.appendChild(overlay);
+}
+
+function saveIndentsData(numCircles) {
+  var s = indentData.summary;
+  s.date        = document.getElementById('if_date').value || s.date;
+  s.totalIndents= parseInt(document.getElementById('if_indents').value)||0;
+  s.imlCases    = parseInt(document.getElementById('if_iml').value)||0;
+  s.beerCases   = parseInt(document.getElementById('if_beer').value)||0;
+  s.totalCases  = parseInt(document.getElementById('if_total').value)||0;
+  s.totalValue  = parseFloat(document.getElementById('if_value').value)||0;
+  s.imlBottles=0; s.beerBottles=0; s.totalBottles=0; s.partBottle=0;
+  for(var i=0;i<numCircles;i++) {
+    if(s.circles[i]) {
+      s.circles[i].indents = parseInt(document.getElementById('ic_ind_'+i).value)||0;
+      s.circles[i].iml     = parseInt(document.getElementById('ic_iml_'+i).value)||0;
+      s.circles[i].beer    = parseInt(document.getElementById('ic_beer_'+i).value)||0;
+      s.circles[i].value   = parseFloat(document.getElementById('ic_val_'+i).value)||0;
+    }
+  }
+  indentData.lastRefresh = new Date();
+  document.getElementById('indentFormOverlay').remove();
+  toast('✅ Indent data updated! Dashboard refresh అయింది.', '#f97316');
+  if(currentPage === 'dashboard') renderDashboard();
+}
+
+function parseIndentsPDF(file) {
+  var arrayBuffer;
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    arrayBuffer = e.target.result;
+    // Use pdf.js to extract text
+    if(typeof pdfjsLib === 'undefined') {
+      toast('⚠ PDF library load కాలేదు. Manually enter చేయండి.', '#f59e0b');
+      showUpdateIndentsForm();
+      return;
+    }
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    var loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+    loadingTask.promise.then(function(pdf) {
+      var totalPages = pdf.numPages;
+      var textPromises = [];
+      for(var p = 1; p <= totalPages; p++) {
+        textPromises.push(pdf.getPage(p).then(function(page) {
+          return page.getTextContent().then(function(tc) {
+            return tc.items.map(function(i){ return i.str; }).join(' ');
+          });
+        }));
+      }
+      Promise.all(textPromises).then(function(pages) {
+        var fullText = pages.join('\n');
+        var parsed = extractIndentData(fullText);
+        if(parsed.totalIndents > 0 || parsed.imlCases > 0 || parsed.beerCases > 0) {
+          applyParsedIndentData(parsed);
+          toast('\u2705 PDF parsed! Dashboard updated \u2014 ' + parsed.date, '#10b981');
+        } else {
+          toast('\ud83d\udccb Data detect కాలేదు. Manually enter చేయండి.', '#f59e0b');
+          showUpdateIndentsForm();
+        }
+      }).catch(function() {
+        toast('\u26a0 PDF read error. Manually enter చేయండి.', '#ef4444');
+        showUpdateIndentsForm();
+      });
+    }).catch(function() {
+      toast('\u26a0 PDF open error. Manually enter చేయండి.', '#ef4444');
+      showUpdateIndentsForm();
+    });
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function applyParsedIndentData(parsed) {
+  if(parsed.date)        indentData.summary.date        = parsed.date;
+  if(parsed.totalIndents)indentData.summary.totalIndents= parsed.totalIndents;
+  if(parsed.imlCases)    indentData.summary.imlCases    = parsed.imlCases;
+  if(parsed.beerCases)   indentData.summary.beerCases   = parsed.beerCases;
+  if(parsed.totalCases)  indentData.summary.totalCases  = parsed.totalCases;
+  if(parsed.totalValue)  indentData.summary.totalValue  = parsed.totalValue;
+  indentData.summary.imlBottles=0; indentData.summary.beerBottles=0;
+  indentData.summary.totalBottles=0; indentData.summary.partBottle=0;
+  if(parsed.circles && parsed.circles.length) indentData.summary.circles = parsed.circles;
+  indentData.lastRefresh = new Date();
+  startIndentTimer();
+  if(currentPage === 'dashboard') renderDashboard();
+  if(currentPage === 'uploads') renderUploads();
+}
+
+function extractIndentData(text) {
+  var result = { date:'', totalIndents:0, imlCases:0, beerCases:0, totalCases:0, totalValue:0, circles:[] };
+
+  // Date: "To 23-Apr-2026" or "Reporting From :23-Apr-2026 To 23-Apr-2026"
+  var dateMatch = text.match(/To\s+(\d{1,2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{4})/i);
+  if(dateMatch) result.date = dateMatch[1];
+
+  // Count indent numbers: IND2026DEPOLD...
+  var indentCodes = text.match(/IND\d{4}[A-Z]+\d{6,}/g);
+  result.totalIndents = indentCodes ? [...new Set(indentCodes)].length : 0;
+
+  // Grand Total line: "Total  2189/0  1658/0  18033239.73"
+  var totalLine = text.match(/\bTotal\b\s+(\d+)\/0\s+(\d+)\/0\s+([\d.]+)/i);
+  if(totalLine) {
+    result.imlCases  = parseInt(totalLine[1])||0;
+    result.beerCases = parseInt(totalLine[2])||0;
+    result.totalValue= parseFloat(totalLine[3])||0;
+    result.totalCases= result.imlCases + result.beerCases;
+  }
+
+  // Grand Total Cases
+  var grandMatch = text.match(/Grand Total Cases\/Bottles.*?(\d+)\/0/i);
+  if(grandMatch) result.totalCases = parseInt(grandMatch[1])||result.totalCases;
+
+  // Circle subtotals: "Sub Total  1136/0  520/0  8434119.52"
+  var circleNames = ['ADILABAD','KAGAZNAGAR','ASIFABAD','BHAINSA','UTNOOR','NIRMAL','ECHODA'];
+  circleNames.forEach(function(cn) {
+    var idx = text.toUpperCase().indexOf(cn);
+    if(idx < 0) return;
+    var chunk = text.substring(idx, idx+2000);
+    var subMatch = chunk.match(/Sub Total\s+(\d+)\/0\s+(\d+)\/0\s+([\d.]+)/i);
+    if(subMatch) {
+      var iml=parseInt(subMatch[1])||0, beer=parseInt(subMatch[2])||0, val=parseFloat(subMatch[3])||0;
+      if(iml>0||beer>0) result.circles.push({name:cn,indents:0,iml:iml,beer:beer,value:val});
+    }
+  });
+
+  return result;
+}
+
+
+function tryExtractIndentData(text) {
+  // Try to extract numbers from PDF text
+  try {
+    var dateMatch = text.match(/(\d{1,2}[-\/]\w+[-\/]\d{4})/);
+    var grandMatch = text.match(/Grand\s+Total[^\d]*(\d+)/i);
+    var imlMatch   = text.match(/Total[^\d]*(\d{3,5})\/0[^\d]*IML/i) ||
+                     text.match(/IML.*?(\d{3,5})\/0/i);
+    var beerMatch  = text.match(/Beer.*?(\d{3,5})\/0/i);
+
+    if(!grandMatch) return null;
+    return {
+      date:         dateMatch ? dateMatch[1] : new Date().toLocaleDateString('en-IN'),
+      totalIndents: parseInt((text.match(/\d+\s+\d+\s+IND/) || [''])[0]) || 0,
+      imlCases:     imlMatch  ? parseInt(imlMatch[1])   : 0,
+      beerCases:    beerMatch ? parseInt(beerMatch[1])  : 0,
+      totalCases:   grandMatch? parseInt(grandMatch[1]) : 0,
+      totalValue:   0
+    };
+  } catch(e) { return null; }
+}
+
+function applyIndentData(parsed) {
+  if(parsed.date)         indentData.summary.date         = parsed.date;
+  if(parsed.totalIndents) indentData.summary.totalIndents = parsed.totalIndents;
+  if(parsed.imlCases)     indentData.summary.imlCases     = parsed.imlCases;
+  if(parsed.beerCases)    indentData.summary.beerCases    = parsed.beerCases;
+  if(parsed.totalCases)   indentData.summary.totalCases   = parsed.totalCases;
+  if(parsed.totalValue)   indentData.summary.totalValue   = parsed.totalValue;
+  indentData.summary.imlBottles=0; indentData.summary.beerBottles=0;
+  indentData.summary.totalBottles=0; indentData.summary.partBottle=0;
+  indentData.lastRefresh = new Date();
 }
 
 function setIndentStatus(status) {
@@ -2086,6 +2297,8 @@ function decodeProductCode(code) {
 
 let dsSrch='', dsType='All', dsDate='21-Apr-2026';
 
+let DAILY_SALES_DB_DATE = '21-Apr-2026'; // Updates when new PDF uploaded
+
 function renderDailySales() {
   const types = ['All','Whisky','Beer','Wine','Brandy','Vodka','RTD/Breezer'];
   const pdfFile = uploadedFiles['dailySalesPdf'];
@@ -2100,9 +2313,10 @@ function renderDailySales() {
   if(pdfFile) {
     var d = uploadedFiles['dailySalesPdfDate'] || new Date();
     uploadCard += '<div style="font-size:11px;color:#10b981;margin-top:2px">✅ ' + pdfFile.name + '</div>';
-    uploadCard += '<div style="font-size:10px;color:#475569;margin-top:1px">Uploaded: ' + d.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}) + ' ' + d.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true}) + '</div>';
+    uploadCard += '<div style="font-size:10px;color:#475569;margin-top:1px">Report Date: <b style="color:#f59e0b">' + DAILY_SALES_DB_DATE + '</b> &nbsp;|&nbsp; Uploaded: ' + d.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true}) + '</div>';
   } else {
-    uploadCard += '<div style="font-size:11px;color:#475569;margin-top:2px">PDF upload చేయండి — view చేయవచ్చు</div>';
+    uploadCard += '<div style="font-size:11px;color:#475569;margin-top:2px">PDF upload చేయండి — Daily Sales data view అవుతుంది</div>';
+    uploadCard += '<div style="font-size:10px;color:#334155;margin-top:2px">Current data: <b style="color:#f59e0b">' + DAILY_SALES_DB_DATE + '</b></div>';
   }
   uploadCard += '</div></div>';
   uploadCard += '<div style="display:flex;gap:8px;align-items:center">';
@@ -2287,7 +2501,7 @@ function printDailySales() {
   </head><body>
   <div style="text-align:center;margin-bottom:16px">
     <div style="font-weight:700">IML DEPOT ADILABAD — Product Wise Daily Sales</div>
-    <div>Date: 21-Apr-2026</div>
+    <div>Date: ${DAILY_SALES_DB_DATE}</div>
   </div>
   ${el.querySelector('.table-wrap')?.outerHTML||''}
   </body></html>`);
@@ -2370,12 +2584,11 @@ function handleUpload(key, inputEl) {
     indentData.uploadTime  = new Date();
     indentData.lastRefresh = new Date();
     indentData.status      = 'uploaded';
-    // Reset summary — user should manually enter new data or it stays from last PDF
-    // Keep existing summary but update date/file reference
-    indentData.summary.date = new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});
     startIndentTimer();
-    if(currentPage === 'dashboard') renderDashboard();
-    toast('✅ Licensee Indents PDF uploaded! Dashboard updated.');
+    toast('📂 PDF uploading... Claude AI parsing చేస్తుంది...', '#f97316');
+    // Auto-parse PDF using Claude API
+    parseIndentsPDF(file);
+    return;
   }
 
   renderUploads();
