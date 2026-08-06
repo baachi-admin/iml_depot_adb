@@ -794,23 +794,185 @@ function renderDashboard() {
     if(pc) pc.innerHTML = '<div style="text-align:center;padding:40px;color:#ef4444">⚠ Dashboard load error. Page refresh చేయండి.<br><small>'+err.message+'</small></div>';
   }
 }
+function callClaudeWithPDF(base64Data, promptText, onSuccess, onError) {
+  var apiKey = '';
+  try { apiKey = localStorage.getItem('iml_claude_api_key') || ''; } catch(e){}
+  if(!apiKey) {
+    showAPIKeyForm(function() { callClaudeWithPDF(base64Data, promptText, onSuccess, onError); });
+    return;
+  }
+  fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      messages: [{ role: 'user', content: [
+        { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64Data } },
+        { type: 'text', text: promptText }
+      ]}]
+    })
+  })
+  .then(function(r){ return r.json(); })
+  .then(function(data) {
+    if(data.error) { onError('API Error: ' + (data.error.message||JSON.stringify(data.error))); return; }
+    var text = (data.content||[]).map(function(c){ return c.text||''; }).join('');
+    var clean = text.replace(/```json|```/g,'').trim();
+    try { onSuccess(JSON.parse(clean)); }
+    catch(e) { onError('Parse error: ' + e.message); }
+  })
+  .catch(function(err){ onError('Network error: ' + err.message); });
+}
+
+function showAPIKeyForm(onSaved) {
+  var existing = '';
+  try { existing = localStorage.getItem('iml_claude_api_key') || ''; } catch(e){}
+  var overlay = document.createElement('div');
+  overlay.id = 'apiKeyOverlay';
+  overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.9);z-index:99999;display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box';
+  overlay.innerHTML = `
+  <div style="background:#111827;border:1.5px solid #f97316;border-radius:16px;padding:24px;width:100%;max-width:420px">
+    <div style="font-size:16px;font-weight:900;color:#f97316;margin-bottom:6px">🔑 Claude API Key</div>
+    <div style="font-size:11px;color:#64748b;margin-bottom:16px">
+      PDF auto-parse కోసం Anthropic API key అవసరం.<br>
+      <a href="https://console.anthropic.com" target="_blank" style="color:#3b82f6">console.anthropic.com</a> లో free గా get చేయవచ్చు.
+    </div>
+    <input id="apiKeyInput" type="password" class="form-input" placeholder="sk-ant-api03-..." value="${existing}"
+      style="width:100%;margin-bottom:12px;font-family:monospace;font-size:12px">
+    <div style="display:flex;gap:8px">
+      <button onclick="saveAPIKey()" style="flex:1;background:#f97316;color:#fff;border:none;border-radius:8px;padding:10px;font-size:13px;font-weight:800;cursor:pointer;font-family:Inter,sans-serif">💾 Save & Continue</button>
+      <button onclick="document.getElementById('apiKeyOverlay').remove()" style="background:#334155;color:#94a3b8;border:none;border-radius:8px;padding:10px 14px;font-size:13px;cursor:pointer;font-family:Inter,sans-serif">✕</button>
+    </div>
+    <div style="font-size:10px;color:#334155;margin-top:10px;text-align:center">Key is stored in your browser only — not shared with anyone</div>
+  </div>`;
+  document.body.appendChild(overlay);
+  window._apiKeyCallback = onSaved;
+}
+
+function saveAPIKey() {
+  var key = document.getElementById('apiKeyInput').value.trim();
+  if(!key || !key.startsWith('sk-')) { toast('⚠ Valid API key enter చేయండి (sk- తో start అవ్వాలి)', '#ef4444'); return; }
+  try { localStorage.setItem('iml_claude_api_key', key); } catch(e){}
+  document.getElementById('apiKeyOverlay').remove();
+  toast('✅ API Key saved!', '#10b981');
+  if(window._apiKeyCallback) { window._apiKeyCallback(); window._apiKeyCallback = null; }
+}
+
 function handleDailySalesPdf(input) {
   var file = input && input.files && input.files[0];
   if(!file) return;
   uploadedFiles['dailySalesPdf'] = file;
   uploadedFiles['dailySalesPdfDate'] = new Date();
+  toast('\ud83d\udcca Daily Sales PDF parsing...', '#10b981');
 
-  // Read PDF as text to extract date info from filename
-  var fname = file.name || '';
-  // Try to extract date from filename e.g. "DailySales_21-Apr-2026.pdf"
-  var dateMatch = fname.match(/(\d{1,2}[-_]\w+[-_]\d{4})/);
-  var reportDate = dateMatch ? dateMatch[1].replace(/_/g,'-') : fname.replace('.pdf','');
+  if(typeof pdfjsLib === 'undefined') {
+    toast('\u26a0 PDF library load కాలేదు. Internet check చేయండి.', '#ef4444');
+    return;
+  }
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
-  // Update DAILY_SALES_DB with new file reference date
-  DAILY_SALES_DB_DATE = reportDate;
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    pdfjsLib.getDocument({ data: e.target.result }).promise.then(function(pdf) {
+      var tasks = [];
+      for(var p = 1; p <= pdf.numPages; p++) tasks.push(p);
+      return Promise.all(tasks.map(function(pn) {
+        return pdf.getPage(pn).then(function(pg) {
+          return pg.getTextContent().then(function(tc) {
+            // Group items by y-coordinate to preserve line structure
+            var lineMap = {};
+            tc.items.forEach(function(item) {
+              var y = Math.round(item.transform[5]);
+              if(!lineMap[y]) lineMap[y] = [];
+              lineMap[y].push({x: item.transform[4], str: item.str});
+            });
+            var sortedY = Object.keys(lineMap).map(Number).sort(function(a,b){return b-a;});
+            return sortedY.map(function(y){
+              return lineMap[y].sort(function(a,b){return a.x-b.x;}).map(function(i){return i.str;}).join(' ');
+            }).join('\n');
+          });
+        });
+      }));
+    }).then(function(pageTexts) {
+      var fullText = pageTexts.join('\n');
+      var r = parseDailySalesFromText(fullText, file.name);
+      if(r.rows.length > 0) {
+        DAILY_SALES_DB = r.rows.slice();
+        DAILY_SALES_DB_DATE = r.date;
+        toast('\u2705 ' + r.rows.length + ' products | IML:' + r.imlCases + ' Beer:' + r.beerCases + ' Total:' + (r.imlCases+r.beerCases), '#10b981');
+      } else {
+        toast('\u26a0 Parse failed. Date: ' + r.date, '#f59e0b');
+      }
+      if(currentPage === 'dailysales') renderDailySales();
+    }).catch(function(err) {
+      toast('\u26a0 PDF error: ' + (err.message||err), '#ef4444');
+    });
+  };
+  reader.readAsArrayBuffer(file);
+}
 
-  toast('✅ ' + file.name + ' uploaded! Data updated for ' + reportDate + '.', '#10b981');
-  if(currentPage === 'dailysales') renderDailySales();
+function parseDailySalesFromText(text, filename) {
+  var result = { date: '', rows: [], imlCases: 0, beerCases: 0, imlBtls: 0, beerBtls: 0, totalAmt: 0 };
+
+  // Date: "Report Date from:03-Jul-2026 to:03-Jul-2026"
+  var dm = text.match(/Report Date from:\S+\s+to:(\S+)/i) || text.match(/(\d{1,2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{4})/gi);
+  if(dm) result.date = Array.isArray(dm) ? dm[dm.length-1] : dm[1];
+
+  // Row pattern: "N CODE [NAME] OPENING/X RECEIVED/X SALECASES SALEBTLS AMOUNT CLOSING/X"
+  var ROW = /^(\d{1,3})\s+([A-Z0-9]{10,14})\s*(.*?)\s+(\d+\/\d+)\s+(\d+\/\d+)\s+(\d+)\s+(\d+)\s+([\d,]+\.?\d*)\s+(\d+\/\d+)$/;
+
+  var lines = text.split(/\n/);
+  for(var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    var m = ROW.exec(line);
+    if(!m) continue;
+
+    var code = m[2];
+    var typeChar = code.length > 4 ? code[4] : '';
+    var isBeer = (typeChar === 'B' || typeChar === 'M');
+    var saleCases = parseInt(m[6]) || 0;
+    var saleBtls  = parseInt(m[7]) || 0;
+    var amount    = parseFloat(m[8].replace(/,/g,'')) || 0;
+
+    if(isBeer) { result.beerCases += saleCases; result.beerBtls += saleBtls; }
+    else        { result.imlCases  += saleCases; result.imlBtls  += saleBtls; }
+    result.totalAmt += amount;
+
+    var typeLabel = typeChar === 'W' ? 'Whisky'
+      : typeChar === 'B' ? 'Beer'
+      : typeChar === 'V' ? 'Vodka'
+      : typeChar === 'Y' ? 'Brandy'
+      : typeChar === 'R' ? 'Rum'
+      : typeChar === 'G' ? 'Gin'
+      : typeChar === 'E' ? 'Wine'
+      : typeChar === 'M' ? 'RTD/Breezer' : 'Other';
+
+    var desc = m[3].trim();
+    // If desc is empty (multi-line product name), check previous line
+    if(!desc && i > 0) {
+      var prevLine = lines[i-1].trim();
+      // Previous line is a continuation name if it doesn't match product pattern
+      if(prevLine && !/^\d+\s+[A-Z0-9]{10,14}/.test(prevLine) && !/^(Date|Total|Report|Product|Slno|Opening|Sale|Amount|Closing)/i.test(prevLine)) {
+        desc = prevLine;
+      }
+    }
+    if(!desc) desc = code; // fallback
+    result.rows.push({
+      slno: parseInt(m[1]),
+      code: code,
+      desc: desc,
+      opening: m[4], received: m[5],
+      saleCases: saleCases, saleBtls: saleBtls,
+      amount: amount, closing: m[9],
+      isBeer: isBeer, typeChar: typeChar, type: typeLabel
+    });
+  }
+  return result;
 }
 
 function viewDailySalesPdf() {
@@ -984,57 +1146,32 @@ function saveIndentsData(numCircles) {
 }
 
 function parseIndentsPDF(file) {
-  var arrayBuffer;
   var reader = new FileReader();
   reader.onload = function(e) {
-    arrayBuffer = e.target.result;
-    // Use pdf.js to extract text
-    if(typeof pdfjsLib === 'undefined') {
-      toast('⚠ PDF library load కాలేదు. Manually enter చేయండి.', '#f59e0b');
-      showUpdateIndentsForm();
-      return;
-    }
-    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-    var loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
-    loadingTask.promise.then(function(pdf) {
-      var totalPages = pdf.numPages;
-      var textPromises = [];
-      for(var p = 1; p <= totalPages; p++) {
-        textPromises.push(pdf.getPage(p).then(function(page) {
-          return page.getTextContent().then(function(tc) {
-            return tc.items.map(function(i){ return i.str; }).join(' ');
-          });
-        }));
-      }
-      Promise.all(textPromises).then(function(pages) {
-        var fullText = pages.join('\n');
-        var parsed = extractIndentData(fullText);
-        if(parsed.totalIndents > 0 || parsed.imlCases > 0 || parsed.beerCases > 0) {
-          applyParsedIndentData(parsed);
-          toast('\u2705 PDF parsed! Dashboard updated \u2014 ' + parsed.date, '#10b981');
-        } else {
-          toast('\ud83d\udccb Data detect కాలేదు. Manually enter చేయండి.', '#f59e0b');
-          showUpdateIndentsForm();
-        }
-      }).catch(function() {
-        toast('\u26a0 PDF read error. Manually enter చేయండి.', '#ef4444');
+    var b64 = e.target.result.split(',')[1];
+    toast('\ud83d\udcca Claude AI Indents PDF parse చేస్తుంది...', '#f97316');
+    var prompt = 'This is a Licensee Indents PDF. Extract summary data. Return ONLY valid JSON:\n{"date":"23-Apr-2026","totalIndents":23,"imlCases":2189,"beerCases":1658,"totalCases":3847,"totalValue":18033239.73,"circles":[{"name":"ADILABAD","indents":13,"iml":1136,"beer":520,"value":8434119.52},{"name":"KAGAZNAGAR","indents":5,"iml":444,"beer":840,"value":5051970.62},{"name":"ASIFABAD","indents":1,"iml":321,"beer":247,"value":2667397.87},{"name":"BHAINSA","indents":1,"iml":50,"beer":0,"value":217220},{"name":"UTNOOR","indents":3,"iml":238,"beer":51,"value":1662531.72}]}';
+    callClaudeWithPDF(b64, prompt,
+      function(parsed) {
+        applyParsedIndentData(parsed);
+        toast('\u2705 Indents updated! ' + parsed.date + ' — ' + parsed.totalIndents + ' indents', '#10b981');
+      },
+      function(err) {
+        toast('\u26a0 ' + err + '. Manually enter చేయండి.', '#ef4444');
         showUpdateIndentsForm();
-      });
-    }).catch(function() {
-      toast('\u26a0 PDF open error. Manually enter చేయండి.', '#ef4444');
-      showUpdateIndentsForm();
-    });
+      }
+    );
   };
-  reader.readAsArrayBuffer(file);
+  reader.readAsDataURL(file);
 }
 
 function applyParsedIndentData(parsed) {
-  if(parsed.date)        indentData.summary.date        = parsed.date;
-  if(parsed.totalIndents)indentData.summary.totalIndents= parsed.totalIndents;
-  if(parsed.imlCases)    indentData.summary.imlCases    = parsed.imlCases;
-  if(parsed.beerCases)   indentData.summary.beerCases   = parsed.beerCases;
-  if(parsed.totalCases)  indentData.summary.totalCases  = parsed.totalCases;
-  if(parsed.totalValue)  indentData.summary.totalValue  = parsed.totalValue;
+  if(parsed.date)         indentData.summary.date         = parsed.date;
+  if(parsed.totalIndents) indentData.summary.totalIndents = parsed.totalIndents;
+  if(parsed.imlCases)     indentData.summary.imlCases     = parsed.imlCases;
+  if(parsed.beerCases)    indentData.summary.beerCases    = parsed.beerCases;
+  if(parsed.totalCases)   indentData.summary.totalCases   = parsed.totalCases;
+  if(parsed.totalValue)   indentData.summary.totalValue   = parsed.totalValue;
   indentData.summary.imlBottles=0; indentData.summary.beerBottles=0;
   indentData.summary.totalBottles=0; indentData.summary.partBottle=0;
   if(parsed.circles && parsed.circles.length) indentData.summary.circles = parsed.circles;
@@ -1044,45 +1181,7 @@ function applyParsedIndentData(parsed) {
   if(currentPage === 'uploads') renderUploads();
 }
 
-function extractIndentData(text) {
-  var result = { date:'', totalIndents:0, imlCases:0, beerCases:0, totalCases:0, totalValue:0, circles:[] };
 
-  // Date: "To 23-Apr-2026" or "Reporting From :23-Apr-2026 To 23-Apr-2026"
-  var dateMatch = text.match(/To\s+(\d{1,2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{4})/i);
-  if(dateMatch) result.date = dateMatch[1];
-
-  // Count indent numbers: IND2026DEPOLD...
-  var indentCodes = text.match(/IND\d{4}[A-Z]+\d{6,}/g);
-  result.totalIndents = indentCodes ? [...new Set(indentCodes)].length : 0;
-
-  // Grand Total line: "Total  2189/0  1658/0  18033239.73"
-  var totalLine = text.match(/\bTotal\b\s+(\d+)\/0\s+(\d+)\/0\s+([\d.]+)/i);
-  if(totalLine) {
-    result.imlCases  = parseInt(totalLine[1])||0;
-    result.beerCases = parseInt(totalLine[2])||0;
-    result.totalValue= parseFloat(totalLine[3])||0;
-    result.totalCases= result.imlCases + result.beerCases;
-  }
-
-  // Grand Total Cases
-  var grandMatch = text.match(/Grand Total Cases\/Bottles.*?(\d+)\/0/i);
-  if(grandMatch) result.totalCases = parseInt(grandMatch[1])||result.totalCases;
-
-  // Circle subtotals: "Sub Total  1136/0  520/0  8434119.52"
-  var circleNames = ['ADILABAD','KAGAZNAGAR','ASIFABAD','BHAINSA','UTNOOR','NIRMAL','ECHODA'];
-  circleNames.forEach(function(cn) {
-    var idx = text.toUpperCase().indexOf(cn);
-    if(idx < 0) return;
-    var chunk = text.substring(idx, idx+2000);
-    var subMatch = chunk.match(/Sub Total\s+(\d+)\/0\s+(\d+)\/0\s+([\d.]+)/i);
-    if(subMatch) {
-      var iml=parseInt(subMatch[1])||0, beer=parseInt(subMatch[2])||0, val=parseFloat(subMatch[3])||0;
-      if(iml>0||beer>0) result.circles.push({name:cn,indents:0,iml:iml,beer:beer,value:val});
-    }
-  });
-
-  return result;
-}
 
 
 function tryExtractIndentData(text) {
@@ -2273,7 +2372,7 @@ function renderDenied() {
 
 
 // ══════════════════ DAILY SALES DATA ══════════════════
-const DAILY_SALES_DB = [{"slno": 1, "code": "1605W0742PLL", "desc": "DOWN TOWN WHISKY", "opening": "104/0", "received": "0/0", "saleCases": 7, "saleBtls": 0, "amount": 27916.7, "closing": "97/0"}, {"slno": 2, "code": "1605W0742PNN", "desc": "DOWN TOWN WHISKY", "opening": "1075/0", "received": "0/0", "saleCases": 73, "saleBtls": 0, "amount": 310921.6, "closing": "1002/0"}, {"slno": 3, "code": "1607B5019CAP", "desc": "BUDWEISER KING OF BEERS", "opening": "818/9", "received": "0/0", "saleCases": 107, "saleBtls": 0, "amount": 415117.2, "closing": "711/9"}, {"slno": 4, "code": "1607B5019GBS", "desc": "BUDWEISER KING OF BEERS", "opening": "509/9", "received": "997/1", "saleCases": 144, "saleBtls": 0, "amount": 368611.2, "closing": "1362/10"}, {"slno": 5, "code": "1607B5019GUP", "desc": "BUDWEISER KING OF BEERS", "opening": "21/0", "received": "0/0", "saleCases": 2, "saleBtls": 0, "amount": 5759.2, "closing": "19/0"}, {"slno": 6, "code": "1607B5031CAP", "desc": "BUDWEISER MAGNUM PREMIUM STRONG BEER", "opening": "2460/16", "received": "0/0", "saleCases": 292, "saleBtls": 0, "amount": 1132843.2, "closing": "2168/16"}, {"slno": 7, "code": "1607B5031GBS", "desc": "BUDWEISER MAGNUM PREMIUM STRONG BEER", "opening": "862/0", "received": "674/2", "saleCases": 132, "saleBtls": 11, "amount": 353531.75, "closing": "1403/2"}, {"slno": 8, "code": "1623V0316GPP", "desc": "MAGIC MOMENTS FLAVOURED PR.VODKA-GREEN APPLE", "opening": "154/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 8679.6, "closing": "153/0"}, {"slno": 9, "code": "1623V0316GQQ", "desc": "MAGIC MOMENTS FLAVOURED PR.VODKA-GREEN APPLE", "opening": "87/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 8659.8, "closing": "86/0"}, {"slno": 10, "code": "1623V0316PDD", "desc": "MAGIC MOMENTS FLAVOURED PR.VODKA-GREEN APPLE", "opening": "43/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 9264.84, "closing": "42/0"}, {"slno": 11, "code": "1623V0316PNN", "desc": "MAGIC MOMENTS FLAVOURED PR.VODKA-GREEN APPLE", "opening": "495/0", "received": "0/0", "saleCases": 9, "saleBtls": 0, "amount": 78472.8, "closing": "486/0"}, {"slno": 12, "code": "1623V0320GPP", "desc": "MAGIC MOMENTS FLAVOURED PR.VODKA-ORANGE", "opening": "99/0", "received": "0/0", "saleCases": 3, "saleBtls": 0, "amount": 26038.8, "closing": "96/0"}, {"slno": 13, "code": "1623V0320GQQ", "desc": "MAGIC MOMENTS FLAVOURED PR.VODKA-ORANGE", "opening": "100/0", "received": "0/0", "saleCases": 2, "saleBtls": 0, "amount": 17319.6, "closing": "98/0"}, {"slno": 14, "code": "1623V0320PDD", "desc": "MAGIC MOMENTS FLAVOURED PR.VODKA-ORANGE", "opening": "39/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 9264.84, "closing": "38/0"}, {"slno": 15, "code": "1623V0320PNN", "desc": "MAGIC MOMENTS FLAVOURED PR.VODKA-ORANGE", "opening": "277/0", "received": "0/0", "saleCases": 12, "saleBtls": 0, "amount": 104630.4, "closing": "265/0"}, {"slno": 16, "code": "1623V1936GNN", "desc": "MAGIC MOMENTS REMIX VIVID PINK VODKA", "opening": "55/0", "received": "0/0", "saleCases": 4, "saleBtls": 0, "amount": 36476.8, "closing": "51/0"}, {"slno": 17, "code": "1623V1936GPP", "desc": "MAGIC MOMENTS REMIX VIVID PINK VODKA", "opening": "24/0", "received": "0/0", "saleCases": 3, "saleBtls": 0, "amount": 27238.8, "closing": "21/0"}, {"slno": 18, "code": "1623V1936GQQ", "desc": "MAGIC MOMENTS REMIX VIVID PINK VODKA", "opening": "37/0", "received": "0/0", "saleCases": 3, "saleBtls": 0, "amount": 27179.4, "closing": "34/0"}, {"slno": 19, "code": "1623W0546GPP", "desc": "8PM PREMIUM BLACK WHISKY", "opening": "235/22", "received": "0/0", "saleCases": 62, "saleBtls": 0, "amount": 562935.2, "closing": "173/22"}, {"slno": 20, "code": "1623W0546GQQ", "desc": "8PM PREMIUM BLACK WHISKY", "opening": "246/0", "received": "0/0", "saleCases": 97, "saleBtls": 0, "amount": 878800.6, "closing": "149/0"}, {"slno": 21, "code": "1623W0546PDD", "desc": "8PM PREMIUM BLACK WHISKY", "opening": "194/0", "received": "0/0", "saleCases": 16, "saleBtls": 0, "amount": 161254.4, "closing": "178/0"}, {"slno": 22, "code": "1623W0546PNN", "desc": "8PM PREMIUM BLACK WHISKY", "opening": "1103/0", "received": "0/0", "saleCases": 79, "saleBtls": 0, "amount": 720416.8, "closing": "1024/0"}, {"slno": 23, "code": "1623W2099GNN", "desc": "MORPHEUS ULTRA LUXURY WHISKY", "opening": "11/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 17519.2, "closing": "10/0"}, {"slno": 24, "code": "1623W2099GQQ", "desc": "MORPHEUS ULTRA LUXURY WHISKY", "opening": "19/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 17459.8, "closing": "18/0"}, {"slno": 25, "code": "1626W0019GDD", "desc": "MCDOWELLS NO 1 LUXURY WHISKY", "opening": "208/47", "received": "0/0", "saleCases": 27, "saleBtls": 0, "amount": 228916.8, "closing": "181/47"}, {"slno": 26, "code": "1626W0019GPP", "desc": "MCDOWELLS NO 1 LUXURY WHISKY", "opening": "896/13", "received": "0/0", "saleCases": 13, "saleBtls": 0, "amount": 102434.8, "closing": "883/13"}, {"slno": 27, "code": "1626W0382GDD", "desc": "ROYAL CHALLENGE CLASSIC MALT WHISKY", "opening": "10/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 13278.4, "closing": "9/0"}, {"slno": 28, "code": "1626W0382GNN", "desc": "ROYAL CHALLENGE CLASSIC MALT WHISKY", "opening": "132/43", "received": "0/0", "saleCases": 4, "saleBtls": 0, "amount": 49276.8, "closing": "128/43"}, {"slno": 29, "code": "1626W0426PNN", "desc": "SIGNATURE ULTRA PREMIER GRAIN WHISKY", "opening": "828/0", "received": "0/0", "saleCases": 4, "saleBtls": 0, "amount": 55676.8, "closing": "824/0"}, {"slno": 30, "code": "1626W1233GDD", "desc": "ROYAL CHALLENGE BLENDED WHISKY", "opening": "139/0", "received": "0/0", "saleCases": 6, "saleBtls": 0, "amount": 60470.4, "closing": "133/0"}, {"slno": 31, "code": "1626W1233GNN", "desc": "ROYAL CHALLENGE BLENDED WHISKY", "opening": "452/41", "received": "0/0", "saleCases": 44, "saleBtls": 47, "amount": 410174.02, "closing": "407/41"}, {"slno": 32, "code": "1626W1233GQQ", "desc": "ROYAL CHALLENGE BLENDED WHISKY", "opening": "99/0", "received": "0/0", "saleCases": 12, "saleBtls": 0, "amount": 108717.6, "closing": "87/0"}, {"slno": 33, "code": "1626W7154GQQ", "desc": "BLACK & WHITE BLENDED SCOTCH WHISKY", "opening": "338/8", "received": "0/0", "saleCases": 5, "saleBtls": 0, "amount": 105699.0, "closing": "333/8"}, {"slno": 34, "code": "1626W7154PNN", "desc": "BLACK & WHITE BLENDED SCOTCH WHISKY", "opening": "25/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 21199.2, "closing": "24/0"}, {"slno": 35, "code": "1626W7291GPP", "desc": "BLACK DOG CEN BLACK RES.AGED AND RARE BLD SCT WHISKY", "opening": "119/16", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 22159.6, "closing": "118/16"}, {"slno": 36, "code": "1626W7291GQQ", "desc": "BLACK DOG CEN BLACK RES.AGED AND RARE BLD SCT WHISKY", "opening": "301/0", "received": "0/0", "saleCases": 2, "saleBtls": 0, "amount": 43879.6, "closing": "299/0"}, {"slno": 37, "code": "1647W0258GPP", "desc": "SEAGRAM'S IMPERIAL BLUE CLASSIC GRAIN WHISKY", "opening": "933/0", "received": "0/0", "saleCases": 20, "saleBtls": 0, "amount": 157592.0, "closing": "913/0"}, {"slno": 38, "code": "1647W0475GLL", "desc": "SEAGRAM'S BLENDERS PRIDE SELECT PR. WHISKY", "opening": "146/0", "received": "0/0", "saleCases": 2, "saleBtls": 0, "amount": 27420.2, "closing": "144/0"}, {"slno": 39, "code": "1661B5016GBS", "desc": "KING FISHER PREMIUM LAGER BEER", "opening": "59938/0", "received": "2192/2", "saleCases": 388, "saleBtls": 40, "amount": 727801.73, "closing": "61738/2"}, {"slno": 40, "code": "1661B5017GBS", "desc": "KING FISHER STRONG PREMIUM BEER", "opening": "45933/11", "received": "2194/0", "saleCases": 2222, "saleBtls": 31, "amount": 4359738.42, "closing": "45902/11"}, {"slno": 41, "code": "1661B5029GBS", "desc": "KINGFISHER ULTRA LAGER BEER", "opening": "299/1", "received": "0/0", "saleCases": 48, "saleBtls": 0, "amount": 122870.4, "closing": "251/1"}, {"slno": 42, "code": "1661B5029GUP", "desc": "KINGFISHER ULTRA LAGER BEER", "opening": "369/0", "received": "0/0", "saleCases": 5, "saleBtls": 0, "amount": 14398.0, "closing": "364/0"}, {"slno": 43, "code": "1661B6536GBS", "desc": "KINGFISHER ULTRA MAX PREMIUM STRONG BEER", "opening": "199/0", "received": "0/0", "saleCases": 17, "saleBtls": 0, "amount": 45216.6, "closing": "182/0"}, {"slno": 44, "code": "1672W0256GPP", "desc": "TI MANSION HOUSE GOLD WHISKY", "opening": "51/5", "received": "0/0", "saleCases": 2, "saleBtls": 0, "amount": 18959.2, "closing": "49/5"}, {"slno": 45, "code": "1672W0256GQQ", "desc": "TI MANSION HOUSE GOLD WHISKY", "opening": "39/10", "received": "0/0", "saleCases": 4, "saleBtls": 0, "amount": 37839.2, "closing": "35/10"}, {"slno": 46, "code": "1672Y0605GLL", "desc": "TI MANSION HOUSE XO BRANDY", "opening": "19/6", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 7860.1, "closing": "18/6"}, {"slno": 47, "code": "1672Y0605GQQ", "desc": "TI MANSION HOUSE XO BRANDY", "opening": "205/0", "received": "0/0", "saleCases": 4, "saleBtls": 0, "amount": 30239.2, "closing": "201/0"}, {"slno": 48, "code": "1672Y0605PDD", "desc": "TI MANSION HOUSE XO BRANDY", "opening": "17/0", "received": "0/0", "saleCases": 4, "saleBtls": 0, "amount": 33913.6, "closing": "13/0"}, {"slno": 49, "code": "1678B5016GBS", "desc": "KING FISHER PREMIUM LAGER BEER", "opening": "778/11", "received": "0/0", "saleCases": 467, "saleBtls": 33, "amount": 873641.05, "closing": "308/11"}, {"slno": 50, "code": "1678B5016GUP", "desc": "KING FISHER PREMIUM LAGER BEER", "opening": "63/0", "received": "0/0", "saleCases": 5, "saleBtls": 0, "amount": 12398.0, "closing": "58/0"}, {"slno": 51, "code": "1678B5017GUP", "desc": "KING FISHER STRONG PREMIUM BEER", "opening": "202/0", "received": "0/0", "saleCases": 29, "saleBtls": 0, "amount": 77708.4, "closing": "173/0"}, {"slno": 52, "code": "1686B5122GBS", "desc": "KARJURA STRONG BEER", "opening": "604/0", "received": "0/0", "saleCases": 30, "saleBtls": 0, "amount": 58794.0, "closing": "574/0"}, {"slno": 53, "code": "1695W0259GNN", "desc": "SEAGRAM'S ROYAL STAG BLENDED WHISKY", "opening": "4546/73", "received": "0/0", "saleCases": 221, "saleBtls": 47, "amount": 2024272.42, "closing": "4325/25"}, {"slno": 54, "code": "1695W0259GPP", "desc": "SEAGRAM'S ROYAL STAG BLENDED WHISKY", "opening": "913/15", "received": "0/0", "saleCases": 3, "saleBtls": 0, "amount": 27238.8, "closing": "910/15"}, {"slno": 55, "code": "1695W0259GQQ", "desc": "SEAGRAM'S ROYAL STAG BLENDED WHISKY", "opening": "1319/11", "received": "0/0", "saleCases": 53, "saleBtls": 0, "amount": 480169.4, "closing": "1266/11"}, {"slno": 56, "code": "1695W0475GNN", "desc": "SEAGRAM'S BLENDERS PRIDE SELECT PR. WHISKY", "opening": "566/0", "received": "0/0", "saleCases": 8, "saleBtls": 0, "amount": 111353.6, "closing": "558/0"}, {"slno": 57, "code": "1710M1303GGP", "desc": "BREEZER GOLD TANGY CRANBERRY FLAVOUR", "opening": "1109/19", "received": "0/0", "saleCases": 24, "saleBtls": 0, "amount": 65270.4, "closing": "1085/19"}, {"slno": 58, "code": "1710M1308GGP", "desc": "BREEZER GOLD DELICIOUS BLACKBERRY CRUSH FLAVOUR", "opening": "127/0", "received": "0/0", "saleCases": 5, "saleBtls": 0, "amount": 13598.0, "closing": "122/0"}, {"slno": 59, "code": "1760B5025GBS", "desc": "ROYAL CHALLENGE PREMIUM LAGER BEER", "opening": "5956/5", "received": "3341/7", "saleCases": 79, "saleBtls": 20, "amount": 150023.87, "closing": "9217/0"}, {"slno": 60, "code": "1760B5028GBS", "desc": "HAYWARDS 5000 SUPER STRONG BEER", "opening": "9115/6", "received": "0/0", "saleCases": 171, "saleBtls": 0, "amount": 335125.8, "closing": "8944/6"}, {"slno": 61, "code": "1760B5030GBS", "desc": "KNOCKOUT HIGH PUNCH STRONG BEER", "opening": "6109/22", "received": "0/0", "saleCases": 176, "saleBtls": 21, "amount": 348354.45, "closing": "5932/10"}, {"slno": 62, "code": "1773W0439PDD", "desc": "GOLD MARK SELECT WHISKY", "opening": "537/0", "received": "0/0", "saleCases": 4, "saleBtls": 0, "amount": 26873.6, "closing": "533/0"}, {"slno": 63, "code": "1773W0439PNN", "desc": "GOLD MARK SELECT WHISKY", "opening": "1859/0", "received": "0/0", "saleCases": 113, "saleBtls": 0, "amount": 659829.6, "closing": "1746/0"}, {"slno": 64, "code": "1869W0259GDD", "desc": "SEAGRAM'S ROYAL STAG BLENDED WHISKY", "opening": "1209/0", "received": "0/0", "saleCases": 29, "saleBtls": 0, "amount": 292273.6, "closing": "1180/0"}, {"slno": 65, "code": "1869W0259GLL", "desc": "SEAGRAM'S ROYAL STAG BLENDED WHISKY", "opening": "362/4", "received": "0/0", "saleCases": 21, "saleBtls": 0, "amount": 191837.1, "closing": "341/4"}, {"slno": 66, "code": "1869W0259GPP", "desc": "SEAGRAM'S ROYAL STAG BLENDED WHISKY", "opening": "938/27", "received": "0/0", "saleCases": 38, "saleBtls": 0, "amount": 345024.8, "closing": "900/27"}, {"slno": 67, "code": "1869W0259PXG", "desc": "SEAGRAM'S ROYAL STAG BLENDED WHISKY", "opening": "95/0", "received": "0/0", "saleCases": 12, "saleBtls": 0, "amount": 96559.2, "closing": "83/0"}, {"slno": 68, "code": "1869W0475GDD", "desc": "SEAGRAM'S BLENDERS PRIDE SELECT PR. WHISKY", "opening": "33/0", "received": "0/0", "saleCases": 2, "saleBtls": 0, "amount": 29756.8, "closing": "31/0"}, {"slno": 69, "code": "1869W0475GPP", "desc": "SEAGRAM'S BLENDERS PRIDE SELECT PR. WHISKY", "opening": "602/17", "received": "0/0", "saleCases": 10, "saleBtls": 0, "amount": 138796.0, "closing": "592/17"}, {"slno": 70, "code": "1869W0475GQQ", "desc": "SEAGRAM'S BLENDERS PRIDE SELECT PR. WHISKY", "opening": "711/0", "received": "0/0", "saleCases": 30, "saleBtls": 0, "amount": 415794.0, "closing": "681/0"}, {"slno": 71, "code": "1869W1312GQQ", "desc": "OAKEN GLOW FINEST PREMIUM WHISKY", "opening": "146/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 13059.8, "closing": "145/0"}, {"slno": 72, "code": "1869W1713GNN", "desc": "SEAGRAM'S 100 PIPERS EXQUISITE BLENDED SCOTCH WHISKY", "opening": "65/0", "received": "0/0", "saleCases": 2, "saleBtls": 0, "amount": 43998.4, "closing": "63/0"}, {"slno": 73, "code": "1869W1713GPP", "desc": "SEAGRAM'S 100 PIPERS EXQUISITE BLENDED SCOTCH WHISKY", "opening": "61/0", "received": "0/0", "saleCases": 2, "saleBtls": 0, "amount": 43919.2, "closing": "59/0"}, {"slno": 74, "code": "1869W1713GQQ", "desc": "SEAGRAM'S 100 PIPERS EXQUISITE BLENDED SCOTCH WHISKY", "opening": "138/10", "received": "0/0", "saleCases": 8, "saleBtls": 0, "amount": 175518.4, "closing": "130/10"}, {"slno": 75, "code": "1869W2073GQQ", "desc": "SEAGRAM'S XCLAMATION RESERVE WHISKY", "opening": "441/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 12259.8, "closing": "440/0"}, {"slno": 76, "code": "1869W7355GNN", "desc": "SEAGRAMS BLENDERS PRIDE RES.COLLECTION WHISKY", "opening": "14/47", "received": "0/0", "saleCases": 2, "saleBtls": 0, "amount": 31838.4, "closing": "12/47"}, {"slno": 77, "code": "1869W7355GQQ", "desc": "SEAGRAMS BLENDERS PRIDE RES.COLLECTION WHISKY", "opening": "199/0", "received": "0/0", "saleCases": 2, "saleBtls": 0, "amount": 31719.6, "closing": "197/0"}, {"slno": 78, "code": "1869W7458GQQ", "desc": "SEAGRAM'S 100 PIPERS BLDSCT WHISKY AGED 12 YEARS", "opening": "77/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 30039.8, "closing": "76/0"}, {"slno": 79, "code": "1875W1560GNN", "desc": "ROYAL GREEN SUPREME BLENDED WHISKY", "opening": "715/0", "received": "0/0", "saleCases": 9, "saleBtls": 0, "amount": 82072.8, "closing": "706/0"}, {"slno": 80, "code": "1875W1560GQQ", "desc": "ROYAL GREEN SUPREME BLENDED WHISKY", "opening": "365/0", "received": "0/0", "saleCases": 3, "saleBtls": 0, "amount": 27179.4, "closing": "362/0"}, {"slno": 81, "code": "1875W1560HNN", "desc": "ROYAL GREEN SUPREME BLENDED WHISKY", "opening": "260/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 9119.2, "closing": "259/0"}, {"slno": 82, "code": "1875W7011GLL", "desc": "ROYAL GREEN DELUXE BLENDED WHISKY", "opening": "38/0", "received": "0/0", "saleCases": 2, "saleBtls": 0, "amount": 18270.2, "closing": "36/0"}, {"slno": 83, "code": "1889W0258GQQ", "desc": "SEAGRAM'S IMPERIAL BLUE CLASSIC GRAIN WHISKY", "opening": "413/0", "received": "0/0", "saleCases": 61, "saleBtls": 0, "amount": 479447.8, "closing": "352/0"}, {"slno": 84, "code": "1889Y0605GLL", "desc": "TI MANSION HOUSE XO BRANDY", "opening": "25/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 7860.1, "closing": "24/0"}, {"slno": 85, "code": "1889Y0605GNN", "desc": "TI MANSION HOUSE XO BRANDY", "opening": "376/41", "received": "0/0", "saleCases": 18, "saleBtls": 0, "amount": 135345.6, "closing": "358/41"}, {"slno": 86, "code": "1889Y0605GPP", "desc": "TI MANSION HOUSE XO BRANDY", "opening": "283/5", "received": "0/0", "saleCases": 7, "saleBtls": 0, "amount": 53757.2, "closing": "276/5"}, {"slno": 87, "code": "1889Y0605GQQ", "desc": "TI MANSION HOUSE XO BRANDY", "opening": "154/0", "received": "0/0", "saleCases": 2, "saleBtls": 0, "amount": 15119.6, "closing": "152/0"}, {"slno": 88, "code": "1905W1756GPP", "desc": "ICONIQ WHITE SELECT INTERNATIONAL GRAIN WHISKY", "opening": "171/10", "received": "0/0", "saleCases": 43, "saleBtls": 0, "amount": 338822.8, "closing": "128/10"}, {"slno": 89, "code": "1906W0110PDD", "desc": "OFFICER'S CHOICE RESERVE WHISKY", "opening": "6985/0", "received": "0/0", "saleCases": 169, "saleBtls": 0, "amount": 1270609.6, "closing": "6816/0"}, {"slno": 90, "code": "1906W0110PNN", "desc": "OFFICER'S CHOICE RESERVE WHISKY", "opening": "16222/0", "received": "0/0", "saleCases": 507, "saleBtls": 0, "amount": 3366074.4, "closing": "15715/0"}, {"slno": 91, "code": "1906W0110PPP", "desc": "OFFICER'S CHOICE RESERVE WHISKY", "opening": "797/0", "received": "0/0", "saleCases": 11, "saleBtls": 0, "amount": 72595.6, "closing": "786/0"}, {"slno": 92, "code": "1906W0110PQQ", "desc": "OFFICER'S CHOICE RESERVE WHISKY", "opening": "2515/10", "received": "0/0", "saleCases": 227, "saleBtls": 0, "amount": 1493614.6, "closing": "2288/10"}, {"slno": 93, "code": "1906W0353GLL", "desc": "STERLING RESERVE B7 SELECT BLENDED WHISKY", "opening": "45/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 9135.1, "closing": "44/0"}, {"slno": 94, "code": "1906W0353GQQ", "desc": "STERLING RESERVE B7 SELECT BLENDED WHISKY", "opening": "224/3", "received": "0/0", "saleCases": 5, "saleBtls": 0, "amount": 45299.0, "closing": "219/3"}, {"slno": 95, "code": "1906W0353PNN", "desc": "STERLING RESERVE B7 SELECT BLENDED WHISKY", "opening": "137/0", "received": "0/0", "saleCases": 3, "saleBtls": 0, "amount": 27357.6, "closing": "134/0"}, {"slno": 96, "code": "1906W0355GQQ", "desc": "STERLING RESERVE B10 PREMIERE BLENDED WHISKY", "opening": "48/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 14259.8, "closing": "47/0"}, {"slno": 97, "code": "1906W1756GNN", "desc": "ICONIQ WHITE SELECT INTERNATIONAL GRAIN WHISKY", "opening": "1063/0", "received": "0/0", "saleCases": 74, "saleBtls": 0, "amount": 586020.8, "closing": "989/0"}, {"slno": 98, "code": "1906W1756GQQ", "desc": "ICONIQ WHITE SELECT INTERNATIONAL GRAIN WHISKY", "opening": "367/6", "received": "0/0", "saleCases": 110, "saleBtls": 0, "amount": 864578.0, "closing": "257/6"}, {"slno": 99, "code": "1906W1756PDD", "desc": "ICONIQ WHITE SELECT INTERNATIONAL GRAIN WHISKY", "opening": "366/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 8478.4, "closing": "365/0"}, {"slno": 100, "code": "1906W2088PDD", "desc": "SUMO SUPREME WHISKY", "opening": "18/0", "received": "0/0", "saleCases": 18, "saleBtls": 0, "amount": 89251.2, "closing": "0/0"}, {"slno": 101, "code": "1906W2088PNN", "desc": "SUMO SUPREME WHISKY", "opening": "2697/0", "received": "0/0", "saleCases": 50, "saleBtls": 0, "amount": 212960.0, "closing": "2647/0"}, {"slno": 102, "code": "1906Y1953GNN", "desc": "GOLDEN MIST CLASSIC BRANDY", "opening": "41/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 7519.2, "closing": "40/0"}, {"slno": 103, "code": "1913W0019GDD", "desc": "MCDOWELLS NO 1 LUXURY WHISKY", "opening": "406/0", "received": "0/0", "saleCases": 61, "saleBtls": 95, "amount": 525572.48, "closing": "344/0"}, {"slno": 104, "code": "1913W0019GLL", "desc": "MCDOWELLS NO 1 LUXURY WHISKY", "opening": "417/4", "received": "0/0", "saleCases": 14, "saleBtls": 0, "amount": 110041.4, "closing": "403/4"}, {"slno": 105, "code": "1913W0019GNN", "desc": "MCDOWELLS NO 1 LUXURY WHISKY", "opening": "6673/3", "received": "599/25", "saleCases": 287, "saleBtls": 47, "amount": 2280564.62, "closing": "6984/28"}, {"slno": 106, "code": "1913W0019GPP", "desc": "MCDOWELLS NO 1 LUXURY WHISKY", "opening": "888/11", "received": "250/0", "saleCases": 5, "saleBtls": 0, "amount": 39398.0, "closing": "1133/11"}, {"slno": 107, "code": "1913W0019GQQ", "desc": "MCDOWELLS NO 1 LUXURY WHISKY", "opening": "757/0", "received": "249/3", "saleCases": 16, "saleBtls": 0, "amount": 125756.8, "closing": "990/3"}, {"slno": 108, "code": "1913W0426GLL", "desc": "SIGNATURE ULTRA PREMIER GRAIN WHISKY", "opening": "16/3", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 13410.1, "closing": "15/3"}, {"slno": 109, "code": "1913W0426GPP", "desc": "SIGNATURE ULTRA PREMIER GRAIN WHISKY", "opening": "390/10", "received": "0/0", "saleCases": 2, "saleBtls": 0, "amount": 27759.2, "closing": "388/10"}, {"slno": 110, "code": "1913W0426GQQ", "desc": "SIGNATURE ULTRA PREMIER GRAIN WHISKY", "opening": "120/0", "received": "199/11", "saleCases": 3, "saleBtls": 0, "amount": 41579.4, "closing": "316/11"}, {"slno": 111, "code": "1913W1233GLL", "desc": "ROYAL CHALLENGE BLENDED WHISKY", "opening": "84/2", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 9135.1, "closing": "83/2"}, {"slno": 112, "code": "1913W1233GPP", "desc": "ROYAL CHALLENGE BLENDED WHISKY", "opening": "857/21", "received": "0/0", "saleCases": 5, "saleBtls": 0, "amount": 45398.0, "closing": "852/21"}, {"slno": 113, "code": "1913W1233GQQ", "desc": "ROYAL CHALLENGE BLENDED WHISKY", "opening": "527/12", "received": "0/0", "saleCases": 21, "saleBtls": 0, "amount": 190255.8, "closing": "506/12"}, {"slno": 114, "code": "1913W1233PXG", "desc": "ROYAL CHALLENGE BLENDED WHISKY", "opening": "286/0", "received": "0/0", "saleCases": 20, "saleBtls": 0, "amount": 160932.0, "closing": "266/0"}, {"slno": 115, "code": "1915W1746PLL", "desc": "DK DOUBLE KICK SUPERIOR WHISKY", "opening": "293/0", "received": "0/0", "saleCases": 141, "saleBtls": 0, "amount": 552311.1, "closing": "152/0"}, {"slno": 116, "code": "1915W1746PNN", "desc": "DK DOUBLE KICK SUPERIOR WHISKY", "opening": "575/0", "received": "1500/0", "saleCases": 1658, "saleBtls": 0, "amount": 7061753.6, "closing": "417/0"}, {"slno": 117, "code": "1915Y1912GNN", "desc": "ROYAL PALACE VSOP FINE BRANDY", "opening": "189/0", "received": "0/0", "saleCases": 2, "saleBtls": 0, "amount": 15038.4, "closing": "187/0"}, {"slno": 118, "code": "1915Y1912GPP", "desc": "ROYAL PALACE VSOP FINE BRANDY", "opening": "21/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 7679.6, "closing": "20/0"}, {"slno": 119, "code": "1915Y1912GQQ", "desc": "ROYAL PALACE VSOP FINE BRANDY", "opening": "6/0", "received": "0/0", "saleCases": 2, "saleBtls": 0, "amount": 15119.6, "closing": "4/0"}, {"slno": 120, "code": "1915Y1912PDD", "desc": "ROYAL PALACE VSOP FINE BRANDY", "opening": "39/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 8478.4, "closing": "38/0"}, {"slno": 121, "code": "1916W0239GPP", "desc": "TEACHERS HIGHLAND CREAM BLENDED SCOTCH WHISKY", "opening": "37/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 23559.6, "closing": "36/0"}, {"slno": 122, "code": "1916W0239GQQ", "desc": "TEACHERS HIGHLAND CREAM BLENDED SCOTCH WHISKY", "opening": "205/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 23539.8, "closing": "204/0"}, {"slno": 123, "code": "1916W0239PNN", "desc": "TEACHERS HIGHLAND CREAM BLENDED SCOTCH WHISKY", "opening": "37/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 23599.2, "closing": "36/0"}, {"slno": 124, "code": "1916W0797GPP", "desc": "OAKSMITH INTERNATIONAL BLENDED WHISKY", "opening": "397/0", "received": "0/0", "saleCases": 9, "saleBtls": 0, "amount": 96116.4, "closing": "388/0"}, {"slno": 125, "code": "1916W0797GQQ", "desc": "OAKSMITH INTERNATIONAL BLENDED WHISKY", "opening": "401/3", "received": "0/0", "saleCases": 6, "saleBtls": 0, "amount": 63958.8, "closing": "395/3"}, {"slno": 126, "code": "1916W0797PNN", "desc": "OAKSMITH INTERNATIONAL BLENDED WHISKY", "opening": "346/0", "received": "0/0", "saleCases": 7, "saleBtls": 0, "amount": 75034.4, "closing": "339/0"}, {"slno": 127, "code": "1916W0798GQQ", "desc": "OAKSMITH GOLD INTERNATIONAL BLENDED WHISKY", "opening": "211/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 15059.8, "closing": "210/0"}, {"slno": 128, "code": "1916W0798PNN", "desc": "OAKSMITH GOLD INTERNATIONAL BLENDED WHISKY", "opening": "80/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 15119.2, "closing": "79/0"}, {"slno": 129, "code": "1919W0456PDD", "desc": "ORIGINAL CHOICE SELECT WHISKY", "opening": "506/0", "received": "0/0", "saleCases": 5, "saleBtls": 0, "amount": 33592.0, "closing": "501/0"}, {"slno": 130, "code": "1919W0456PLL", "desc": "ORIGINAL CHOICE SELECT WHISKY", "opening": "838/0", "received": "0/0", "saleCases": 11, "saleBtls": 0, "amount": 64846.1, "closing": "827/0"}, {"slno": 131, "code": "1919W0456PNN", "desc": "ORIGINAL CHOICE SELECT WHISKY", "opening": "10980/0", "received": "0/0", "saleCases": 185, "saleBtls": 47, "amount": 1085969.55, "closing": "10794/0"}, {"slno": 132, "code": "1922W1941PLL", "desc": "DK DOUBLE KICK FINE WHISKY", "opening": "274/0", "received": "0/0", "saleCases": 50, "saleBtls": 0, "amount": 195855.0, "closing": "224/0"}, {"slno": 133, "code": "1924W0481GNN", "desc": "ARISTOCRAT PREMIUM RESERVE WHISKY", "opening": "196/0", "received": "0/0", "saleCases": 3, "saleBtls": 0, "amount": 23757.6, "closing": "193/0"}, {"slno": 134, "code": "1924W0481GPP", "desc": "ARISTOCRAT PREMIUM RESERVE WHISKY", "opening": "87/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 7879.6, "closing": "86/0"}, {"slno": 135, "code": "1928W0258GNN", "desc": "SEAGRAM'S IMPERIAL BLUE CLASSIC GRAIN WHISKY", "opening": "7/0", "received": "0/0", "saleCases": 4, "saleBtls": 0, "amount": 31676.8, "closing": "3/0"}, {"slno": 136, "code": "1929W0258GDD", "desc": "SEAGRAM'S IMPERIAL BLUE CLASSIC GRAIN WHISKY", "opening": "160/0", "received": "0/0", "saleCases": 157, "saleBtls": 285, "amount": 1356279.05, "closing": "0/0"}, {"slno": 137, "code": "1929W0258GLL", "desc": "SEAGRAM'S IMPERIAL BLUE CLASSIC GRAIN WHISKY", "opening": "384/0", "received": "0/0", "saleCases": 53, "saleBtls": 0, "amount": 416585.3, "closing": "331/0"}, {"slno": 138, "code": "1929W0258GNN", "desc": "SEAGRAM'S IMPERIAL BLUE CLASSIC GRAIN WHISKY", "opening": "4564/42", "received": "0/0", "saleCases": 311, "saleBtls": 279, "amount": 2508901.55, "closing": "4247/42"}, {"slno": 139, "code": "1929W0258GPP", "desc": "SEAGRAM'S IMPERIAL BLUE CLASSIC GRAIN WHISKY", "opening": "712/10", "received": "0/0", "saleCases": 8, "saleBtls": 0, "amount": 63036.8, "closing": "704/10"}, {"slno": 140, "code": "1929W0258GQQ", "desc": "SEAGRAM'S IMPERIAL BLUE CLASSIC GRAIN WHISKY", "opening": "114/5", "received": "0/0", "saleCases": 3, "saleBtls": 0, "amount": 23579.4, "closing": "111/5"}, {"slno": 141, "code": "2023W1653GCP", "desc": "JOHNNIE WALKER BLONDE BLENDED SCOTCH WHISKY", "opening": "9/0", "received": "0/0", "saleCases": 9, "saleBtls": 0, "amount": 142196.4, "closing": "0/0"}, {"slno": 142, "code": "2023W8098GQQ", "desc": "JOHNNIE WALKER BLACK LABEL BLENDED SCOTCH WHISKY", "opening": "48/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 48039.8, "closing": "47/0"}, {"slno": 143, "code": "2023W9099GPP", "desc": "JOHNNIE WALKER RED LABEL BLENDED SCOTCH WHISKY", "opening": "14/11", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 28759.6, "closing": "13/11"}, {"slno": 144, "code": "2023W9099GQQ", "desc": "JOHNNIE WALKER RED LABEL BLENDED SCOTCH WHISKY", "opening": "62/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 26439.8, "closing": "61/0"}, {"slno": 145, "code": "2552E3537GNN", "desc": "ELITE CABERNET SHIRAZ RED WINE", "opening": "53/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 12319.2, "closing": "52/0"}, {"slno": 146, "code": "2552E3539GNN", "desc": "ELITE CLUB RED WINE", "opening": "188/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 9119.2, "closing": "187/0"}, {"slno": 147, "code": "2552E3594PNN", "desc": "MAJIC PORT WINE", "opening": "25/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 6719.2, "closing": "24/0"}, {"slno": 148, "code": "2839E2022GNN", "desc": "YAMUNA PREMIUM RED WINE", "opening": "25/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 9119.2, "closing": "24/0"}, {"slno": 149, "code": "2839E2022GPP", "desc": "YAMUNA PREMIUM RED WINE", "opening": "3/0", "received": "0/0", "saleCases": 3, "saleBtls": 0, "amount": 27238.8, "closing": "0/0"}, {"slno": 150, "code": "2897E0698GNN", "desc": "KYRA RED RISERVA", "opening": "138/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 9119.2, "closing": "137/0"}, {"slno": 151, "code": "2897E0698GPP", "desc": "KYRA RED RISERVA", "opening": "18/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 9079.6, "closing": "17/0"}, {"slno": 152, "code": "2897E0698GQQ", "desc": "KYRA RED RISERVA", "opening": "48/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 9059.8, "closing": "47/0"}, {"slno": 153, "code": "2897E3108GNN", "desc": "FRATELLI SHIRAZ", "opening": "28/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 11519.2, "closing": "27/0"}, {"slno": 154, "code": "2897E3108GPP", "desc": "FRATELLI SHIRAZ", "opening": "13/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 11479.6, "closing": "12/0"}, {"slno": 155, "code": "2897E3108GQQ", "desc": "FRATELLI SHIRAZ", "opening": "26/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 11459.8, "closing": "25/0"}, {"slno": 156, "code": "3007W1215GQM", "desc": "JAMESON BLACK BARREL TRIPLE DISTILLED IRISH WHISKY", "opening": "6/4", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 20119.8, "closing": "5/4"}, {"slno": 157, "code": "3007W9079GQM", "desc": "CHIVAS REGAL AGED 18 YEARS BLENDED SCOTCH WHISKY", "opening": "5/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 45619.8, "closing": "4/0"}, {"slno": 158, "code": "3190W1244GQQ", "desc": "ROYAL RANTHAMBORE HERITAGE COLLECTION WHISKY", "opening": "23/0", "received": "0/0", "saleCases": 1, "saleBtls": 0, "amount": 24339.8, "closing": "22/0"}, {"slno": 159, "code": "3225E3639GNN", "desc": "SULA CABERNET SHIRAJ RED WINE", "opening": "272/0", "received": "0/0", "saleCases": 2, "saleBtls": 0, "amount": 24638.4, "closing": "270/0"}, {"slno": 160, "code": "3225E3639GPP", "desc": "SULA CABERNET SHIRAJ RED WINE", "opening": "218/0", "received": "0/0", "saleCases": 2, "saleBtls": 0, "amount": 24559.2, "closing": "216/0"}];
+let DAILY_SALES_DB = []
 
 // Product code decoder
 function decodeProductCode(code) {
@@ -2298,9 +2397,9 @@ function decodeProductCode(code) {
   };
 }
 
-let dsSrch='', dsType='All', dsDate='21-Apr-2026';
+let dsSrch='', dsType='All';
 
-let DAILY_SALES_DB_DATE = '21-Apr-2026'; // Updates when new PDF uploaded
+let DAILY_SALES_DB_DATE = '';
 
 function renderDailySales() {
   const types = ['All','Whisky','Beer','Wine','Brandy','Vodka','RTD/Breezer'];
@@ -2328,15 +2427,25 @@ function renderDailySales() {
   }
   uploadCard += '<label style="background:#10b981;color:#fff;border-radius:8px;padding:7px 14px;font-size:12px;font-weight:700;cursor:pointer;font-family:Inter,sans-serif;white-space:nowrap">';
   uploadCard += '<input type="file" accept=".pdf" style="display:none" onchange="handleDailySalesPdf(this)">';
-  uploadCard += (pdfFile ? '🔄 Replace' : '⬆ Upload PDF') + '</label>';
+  uploadCard += (pdfFile ? '🔄 Replace PDF' : '⬆ Upload PDF') + '</label>';
+  uploadCard += '<label style="background:#3b82f6;color:#fff;border-radius:8px;padding:7px 14px;font-size:12px;font-weight:700;cursor:pointer;font-family:Inter,sans-serif;white-space:nowrap">';
+  uploadCard += '<input type="file" accept=".csv,.xlsx,.xls" style="display:none" onchange="handleDailySalesCSV(this)">';
+  uploadCard += '📊 Upload CSV/Excel</label>';
   uploadCard += '</div></div></div>';
 
   const filtered = DAILY_SALES_DB.filter(r => {
-    const dec = decodeProductCode(r.code);
-    const matchType = dsType==='All' || dec.type===dsType;
-    const matchSearch = r.desc.toLowerCase().includes(dsSrch.toLowerCase()) || r.code.toLowerCase().includes(dsSrch.toLowerCase());
+    // Use parsed type if available, else fallback to product code decode
+    var rType = r.type || (decodeProductCode(r.code)||{}).type || 'Other';
+    const matchType = dsType==='All' || rType===dsType;
+    const matchSearch = (r.desc||'').toLowerCase().includes(dsSrch.toLowerCase()) || (r.code||'').toLowerCase().includes(dsSrch.toLowerCase());
     return matchType && matchSearch;
   });
+
+  // IML/Beer summary from full DB
+  const imlCasesTotal  = DAILY_SALES_DB.filter(r=>!r.isBeer).reduce((a,b)=>a+(b.saleCases||0),0);
+  const beerCasesTotal = DAILY_SALES_DB.filter(r=>r.isBeer).reduce((a,b)=>a+(b.saleCases||0),0);
+  const imlBtlsTotal   = DAILY_SALES_DB.filter(r=>!r.isBeer).reduce((a,b)=>a+(b.saleBtls||0),0);
+  const beerBtlsTotal  = DAILY_SALES_DB.filter(r=>r.isBeer).reduce((a,b)=>a+(b.saleBtls||0),0);
 
   const totalCases = filtered.reduce((a,b)=>a+b.saleCases,0);
   const totalBtls = filtered.reduce((a,b)=>a+b.saleBtls,0);
@@ -2361,7 +2470,7 @@ function renderDailySales() {
         <span style="font-size:32px">📋</span>
         <div>
           <div style="font-size:16px;font-weight:800;color:#06b6d4">Product Wise Daily Sales</div>
-          <div style="font-size:12px;color:#475569;margin-top:2px">Date: ${dsDate} &nbsp;|&nbsp; IML DEPOT ADILABAD</div>
+          <div style="font-size:12px;color:#475569;margin-top:2px">Date: ${DAILY_SALES_DB_DATE||'PDF upload చేయండి'} &nbsp;|&nbsp; IML DEPOT ADILABAD</div>
         </div>
       </div>
       <div style="display:flex;gap:10px;flex-wrap:wrap">
@@ -2380,6 +2489,21 @@ function renderDailySales() {
       </div>
     </div>
   </div>
+
+  <!-- IML / Beer Summary -->
+  ${DAILY_SALES_DB.length > 0 ? `
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
+    <div style="background:linear-gradient(135deg,#f59e0b22,#0a0f1e);border:1px solid #f59e0b44;border-radius:12px;padding:16px;text-align:center">
+      <div style="font-size:11px;color:#f59e0b;font-weight:700;margin-bottom:4px">🥃 IML</div>
+      <div style="font-size:26px;font-weight:900;color:#f59e0b">${imlCasesTotal.toLocaleString('en-IN')}</div>
+      <div style="font-size:10px;color:#64748b;margin-top:2px">Cases &nbsp;|&nbsp; ${imlBtlsTotal} Btls</div>
+    </div>
+    <div style="background:linear-gradient(135deg,#3b82f622,#0a0f1e);border:1px solid #3b82f644;border-radius:12px;padding:16px;text-align:center">
+      <div style="font-size:11px;color:#3b82f6;font-weight:700;margin-bottom:4px">🍺 Beer</div>
+      <div style="font-size:26px;font-weight:900;color:#3b82f6">${beerCasesTotal.toLocaleString('en-IN')}</div>
+      <div style="font-size:10px;color:#64748b;margin-top:2px">Cases &nbsp;|&nbsp; ${beerBtlsTotal} Btls</div>
+    </div>
+  </div>` : ''}
 
   <!-- Category Summary Bars -->
   <div class="card">
@@ -2496,19 +2620,104 @@ function toggleCodeGuide() {
 }
 
 function printDailySales() {
-  const el = document.getElementById('pageContent');
-  if(!el) return;
-  const w = window.open('','_blank');
-  w.document.write(`<html><head><title>Product Wise Daily Sales - IML Depot Adilabad</title>
-  <style>body{font-family:Arial,sans-serif;font-size:11px;color:#000;padding:20px}h2{text-align:center;font-size:14px}table{width:100%;border-collapse:collapse}th{background:#f1f5f9;padding:6px;text-align:left;border:1px solid #ccc;font-size:10px}td{padding:5px 6px;border:1px solid #eee}.summary{display:flex;gap:20px;margin:10px 0}.sum-box{background:#f8fafc;padding:10px;border-radius:6px;text-align:center}.sum-val{font-size:16px;font-weight:900}</style>
-  </head><body>
-  <div style="text-align:center;margin-bottom:16px">
-    <div style="font-weight:700">IML DEPOT ADILABAD — Product Wise Daily Sales</div>
-    <div>Date: ${DAILY_SALES_DB_DATE}</div>
-  </div>
-  ${el.querySelector('.table-wrap')?.outerHTML||''}
-  </body></html>`);
-  w.document.close(); w.print();
+  if(!DAILY_SALES_DB.length) { toast('⚠ PDF upload చేయండి', '#ef4444'); return; }
+
+  const filtered = DAILY_SALES_DB.filter(function(r) {
+    var rType = r.type || (decodeProductCode(r.code)||{}).type || 'Other';
+    var matchType = dsType==='All' || rType===dsType;
+    var matchSearch = (r.desc||'').toLowerCase().includes(dsSrch.toLowerCase()) || (r.code||'').toLowerCase().includes(dsSrch.toLowerCase());
+    return matchType && matchSearch;
+  });
+
+  var totalCases = filtered.reduce(function(a,b){return a+(b.saleCases||0);},0);
+  var totalBtls  = filtered.reduce(function(a,b){return a+(b.saleBtls||0);},0);
+  var totalAmt   = filtered.reduce(function(a,b){return a+(b.amount||0);},0);
+  var imlCases   = filtered.filter(function(r){return !r.isBeer;}).reduce(function(a,b){return a+(b.saleCases||0);},0);
+  var beerCases  = filtered.filter(function(r){return r.isBeer;}).reduce(function(a,b){return a+(b.saleCases||0);},0);
+
+  // Sort by description ascending
+  var sortedFiltered = filtered.slice().sort(function(a,b){
+    var da = (a.desc&&a.desc!==a.code)?a.desc:a.code;
+    var db = (b.desc&&b.desc!==b.code)?b.desc:b.code;
+    return da.localeCompare(db);
+  });
+  var rows = sortedFiltered.map(function(r,i) {
+    var dec = decodeProductCode(r.code);
+    var rType = r.type || dec.type || 'Other';
+    var size  = dec.size || '—';
+    var desc  = (r.desc && r.desc !== r.code && r.desc !== '('+r.code+')') ? r.desc : '';
+    if(!desc) desc = (dec.type||'') + ' ' + r.code;
+    return '<tr style="background:'+(i%2===0?'#fff':'#f8fafc')+'">'
+      +'<td style="text-align:center;color:#666">'+(i+1)+'</td>'
+      +'<td style="font-family:monospace;font-size:10px;color:#7c3aed;font-weight:700">'+r.code+'</td>'
+      +'<td><span style="background:'+(r.isBeer?'#dcfce7':'#dbeafe')+';color:'+(r.isBeer?'#16a34a':'#1d4ed8')+';padding:2px 8px;border-radius:10px;font-size:9px;font-weight:700">'+rType+'</span></td>'
+      +'<td style="font-size:10px;color:#0891b2">'+size+'</td>'
+      +'<td style="font-weight:600;font-size:11px">'+desc+'</td>'
+      +'<td style="text-align:right;color:#64748b">'+r.opening+'</td>'
+      +'<td style="text-align:right;color:'+(r.received&&r.received!=='0/0'?'#16a34a':'#94a3b8')+'">'+r.received+'</td>'
+      +'<td style="text-align:right;font-weight:900;color:'+(r.saleCases>0?'#d97706':'#94a3b8')+';font-size:12px">'+(r.saleCases||'—')+'</td>'
+      +'<td style="text-align:right;color:'+(r.saleBtls>0?'#7c3aed':'#94a3b8')+'">'+(r.saleBtls||'—')+'</td>'
+      
+      +'<td style="text-align:right;color:#64748b">'+r.closing+'</td>'
+      +'</tr>';
+  }).join('');
+
+  var w = window.open('','_blank');
+  if(!w) { toast('⚠ Popup blocked! Browser లో allow చేయండి', '#ef4444'); return; }
+  w.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8">'
+    +'<title>IML Depot Adilabad — Daily Sales '+DAILY_SALES_DB_DATE+'</title>'
+    +'<style>'
+    +'@page{size:A4 landscape;margin:8mm}'
+    +'*{box-sizing:border-box;margin:0;padding:0}'
+    +'body{font-family:Arial,sans-serif;font-size:10px;color:#000;background:#fff}'
+    +'.hdr{text-align:center;padding:8px 0 10px;border-bottom:2px solid #1e3a5f;margin-bottom:10px}'
+    +'.hdr h1{font-size:14px;font-weight:900;color:#1e3a5f}'
+    +'.hdr p{font-size:11px;color:#555;margin-top:3px}'
+    +'.summary{display:flex;gap:12px;margin-bottom:10px}'
+    +'.sum-box{flex:1;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:8px;text-align:center}'
+    +'.sum-val{font-size:18px;font-weight:900;color:#1e293b}'
+    +'.sum-lbl{font-size:9px;color:#64748b;margin-top:2px}'
+    +'table{width:100%;border-collapse:collapse}'
+    +'th{background:#1e3a5f;color:#fff;padding:5px 6px;text-align:left;font-size:9px;font-weight:700}'
+    +'th.num{text-align:right}'
+    +'td{padding:4px 6px;border-bottom:1px solid #f1f5f9;font-size:10px}'
+    +'.no-print{display:none}'
+    +'@media print{.no-print{display:none!important}}'
+    +'</style></head><body>'
+    +'<div class="no-print" style="text-align:center;padding:10px;background:#1e3a5f;color:#fff;margin-bottom:10px">'
+    +'<button onclick="window.print()" style="background:#fff;color:#1e3a5f;border:none;padding:6px 18px;font-weight:900;border-radius:4px;cursor:pointer;font-size:13px">🖨 Print / Save PDF</button>'
+    +'</div>'
+    +'<div class="hdr"><h1>IML DEPOT ADILABAD — Product Wise Daily Sales</h1>'
+    +'<p>Date: '+DAILY_SALES_DB_DATE+' &nbsp;|&nbsp; Filter: '+dsType+' &nbsp;|&nbsp; Products: '+filtered.length+'</p></div>'
+    +'<div class="summary">'
+    +'<div class="sum-box"><div class="sum-val" style="color:#d97706">'+imlCases.toLocaleString('en-IN')+'</div><div class="sum-lbl">🥃 IML Cases</div></div>'
+    +'<div class="sum-box"><div class="sum-val" style="color:#16a34a">'+beerCases.toLocaleString('en-IN')+'</div><div class="sum-lbl">🍺 Beer Cases</div></div>'
+    +'<div class="sum-box"><div class="sum-val" style="color:#1d4ed8">'+totalCases.toLocaleString('en-IN')+'</div><div class="sum-lbl">Total Cases</div></div>'
+    +'<div class="sum-box"><div class="sum-val" style="color:#7c3aed">'+totalBtls.toLocaleString('en-IN')+'</div><div class="sum-lbl">Sale Btls</div></div>'
+    
+    +'</div>'
+    +'<table><thead><tr>'
+    +'<th style="width:28px">#</th>'
+    +'<th style="min-width:110px">Product Code</th>'
+    +'<th>Type</th><th>Size</th>'
+    +'<th style="min-width:200px">Description</th>'
+    +'<th class="num">Opening</th><th class="num">Received</th>'
+    +'<th class="num" style="color:#fcd34d">Sale Cases</th>'
+    +'<th class="num">Sale Btls</th>'
+    
+    +'<th class="num">Closing</th>'
+    +'</tr></thead><tbody>'
+    +rows
+    +'<tr style="background:#f1f5f9;font-weight:900;border-top:2px solid #1e3a5f">'
+    +'<td colspan="7" style="text-align:right;font-size:10px">TOTAL ('+filtered.length+' products) →</td>'
+    +'<td style="text-align:right;color:#d97706;font-size:12px">'+totalCases.toLocaleString('en-IN')+'</td>'
+    +'<td style="text-align:right;color:#7c3aed">'+totalBtls.toLocaleString('en-IN')+'</td>'
+    
+    +'<td></td></tr>'
+    +'</tbody></table>'
+    +'</body></html>');
+  w.document.close();
+  w.onload = function(){ w.print(); };
 }
 
 // ══════════════════ FILE UPLOADS ══════════════════════
